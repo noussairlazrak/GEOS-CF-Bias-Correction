@@ -1,0 +1,17 @@
+name: mlpred
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - zarr
+  - tensorflow
+  - pandas
+  - ipython
+  - matplotlib
+  - numpy
+  - scikit-learn
+  - scipy
+  - seaborn
+  - xgboost
+  - basemap
+prefix: /home/jovyan/users_conda_envs/mlpred
