@@ -1,0 +1,30 @@
+[project]
+name = "geos-cf-bias-correction"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "basemap",
+  "bs4",
+  "cartopy",
+  "fsspec",
+  "geopy",
+  "ipython",
+  "lightgbm",
+  "matplotlib",
+  "numpy<2.0",
+  "pandas",
+  "plotly",
+  "pyod",
+  "requests",
+  "scikit-learn",
+  "scipy",
+  "seaborn",
+  "shap",
+  "timezonefinder",
+  "tqdm",
+  "xarray",
+  "xgboost",
+  "zarr"
+]
