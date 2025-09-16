@@ -12,6 +12,8 @@ import requests
 import json
 import datetime as dt
 
+import boto3
+
 #checking folders if created
 folders = ["precomputed/all_dts/", "plots/","GEOS_CF/","OPENAQ/"]
 
@@ -151,6 +153,11 @@ for key, location_data in list(data.items()):
                 print(merg.columns)
 
                 funcs.save_forecast_to_json(merg, metadata, site_settings=site_settings, species="no2",sources=[ "geoscf","pandora"], output_path=file_path)
+                # Push file to S3
+                s3_client = boto3.client("s3")
+                s3_bucket = "s3://smce-geos-cf-forecasts-oss-shared"
+                s3_fullpath = os.path.join(s3_bucket, file_path.lstrip("./"))
+                s3_client.upload_file(file_path, s3_fullpath)
                 
 
             except Exception as e:
