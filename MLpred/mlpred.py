@@ -673,8 +673,6 @@ class ObsSite:
                 r2 = r2_score(ytest, target)
 
                 # RMSE Computation
-                rmse_1 = np.sqrt(MSE_1(ytest, target))
-                print("RMSE : % f" % (rmse_1))
                 print("Score: ", score)
                 print("mean square error", MSE)
                 print("Root mean square error", RMSE)
