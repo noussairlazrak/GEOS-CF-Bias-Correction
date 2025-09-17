@@ -27,7 +27,7 @@ import requests
 import pickle
 from dateutil.relativedelta import relativedelta
 from sklearn.model_selection import train_test_split, KFold, TimeSeriesSplit
-from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, mean_absolute_error, median_absolute_error
+from sklearn.metrics import root_mean_squared_error, mean_squared_error, r2_score, accuracy_score, mean_absolute_error, median_absolute_error
 from math import sqrt
 from tqdm import tqdm as tqdm
 import shap
@@ -668,7 +668,7 @@ class ObsSite:
 
             if not self._silent:
                 MSE = mean_squared_error(ytest, target)
-                RMSE = mean_squared_error(ytest, target, squared=False)
+                RMSE = root_mean_squared_error(ytest, target)
                 MAE = mean_absolute_error(ytest, target)
                 r2 = r2_score(ytest, target)
 
