@@ -1768,7 +1768,7 @@ def get_localised_forecast(**kwargs):
         eval_set=eval_set
     )
     Y_pred = selected_model.predict(X_test)
-    rmse = round(mean_squared_error(Y_test, Y_pred, squared=False), 2)
+    rmse = round(root_mean_squared_error(Y_test, Y_pred), 2)
     r2 = round(r2_score(Y_test, Y_pred), 2)
     mae = round(mean_absolute_error(Y_test, Y_pred), 2)
     
