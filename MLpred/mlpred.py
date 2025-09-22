@@ -27,7 +27,7 @@ import requests
 import pickle
 from dateutil.relativedelta import relativedelta
 from sklearn.model_selection import train_test_split, KFold, TimeSeriesSplit
-from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, mean_absolute_error, median_absolute_error
+from sklearn.metrics import root_mean_squared_error, mean_squared_error, r2_score, accuracy_score, mean_absolute_error, median_absolute_error
 from math import sqrt
 from tqdm import tqdm as tqdm
 import shap
@@ -668,13 +668,11 @@ class ObsSite:
 
             if not self._silent:
                 MSE = mean_squared_error(ytest, target)
-                RMSE = mean_squared_error(ytest, target, squared=False)
+                RMSE = root_mean_squared_error(ytest, target)
                 MAE = mean_absolute_error(ytest, target)
                 r2 = r2_score(ytest, target)
 
                 # RMSE Computation
-                rmse_1 = np.sqrt(MSE_1(ytest, target))
-                print("RMSE : % f" % (rmse_1))
                 print("Score: ", score)
                 print("mean square error", MSE)
                 print("Root mean square error", RMSE)
@@ -1770,7 +1768,7 @@ def get_localised_forecast(**kwargs):
         eval_set=eval_set
     )
     Y_pred = selected_model.predict(X_test)
-    rmse = round(mean_squared_error(Y_test, Y_pred, squared=False), 2)
+    rmse = round(root_mean_squared_error(Y_test, Y_pred), 2)
     r2 = round(r2_score(Y_test, Y_pred), 2)
     mae = round(mean_absolute_error(Y_test, Y_pred), 2)
     
