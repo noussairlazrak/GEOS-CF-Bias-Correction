@@ -154,9 +154,9 @@ for key, location_data in list(data.items()):
                 funcs.save_forecast_to_json(merg, metadata, site_settings=site_settings, species="no2",sources=[ "geoscf","pandora"], output_path=file_path)
                 # Push file to S3
                 s3_client = boto3.client("s3")
-                s3_bucket = "s3://smce-geos-cf-forecasts-oss-shared"
-                s3_fullpath = os.path.join(s3_bucket, file_path.lstrip("./"))
-                s3_client.upload_file(file_path, s3_fullpath)
+                s3_bucket = "smce-geos-cf-forecasts-oss-shared"
+                s3_key = file_path.lstrip("./")
+                s3_client.upload_file(file_path, s3_bucket, s3_key)
                 
 
             except Exception as e:
