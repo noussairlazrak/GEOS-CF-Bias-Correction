@@ -10,8 +10,8 @@ import pandas as pd
 import numpy as np
 import requests
 import json
-
 import boto3
+import traceback
 
 #checking folders if created
 folders = ["precomputed/all_dts/", "plots/","GEOS_CF/","OPENAQ/"]
@@ -56,6 +56,7 @@ for key, location_data in list(data.items()):
                 funcs.save_forecast_to_json(merra2cnn, metadata, site_settings=site_settings, species="pm25", sources=["merra2", "geoscf"], output_path=f'./precomputed/all_dts/{site}.json')
             except Exception as e:
                 print(f"Error processing merra 2 forecasts in location {key}: {e}")
+                traceback.print_exc()
             
         if location_data["observation_source"] == "NASA Pandora":
             #generting the forecasts routine for GEOS CF PANDORA
@@ -162,4 +163,5 @@ for key, location_data in list(data.items()):
             except Exception as e:
 
                 print(f"Error processing location {key}: {e}")
-                
+                traceback.print_exc()
+
