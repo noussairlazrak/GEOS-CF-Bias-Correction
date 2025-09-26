@@ -8,56 +8,58 @@ This file handles localized forecasts, based on GMAO's GEOS CF and OpenAQ data
 .. contributor:: Noussair Lazrak <noussair.lazrak@nyu.edu>
 """
 
+# Standard library imports
 import sys
 import os
 import re
-import fsspec
-import numpy as np
-from scipy import stats
-import pandas as pd
-import datetime as dt
-from datetime import timedelta
 import time
+import pickle
+import random
+import io
+from math import sqrt
+from datetime import datetime, timedelta
+import warnings
+
+# Third-party imports
+import numpy as np
+import pandas as pd
+import requests
+import fsspec
 import xarray as xr
 import xgboost as xgb
+import lightgbm as lgb
+import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import requests
-import pickle
-from dateutil.relativedelta import relativedelta
-from sklearn.model_selection import train_test_split, KFold, TimeSeriesSplit
-from sklearn.metrics import root_mean_squared_error, mean_squared_error, r2_score, accuracy_score, mean_absolute_error, median_absolute_error
-from math import sqrt
-from tqdm import tqdm as tqdm
+from tqdm import tqdm
 import shap
 from sklearn.base import BaseEstimator
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.model_selection import RandomizedSearchCV, GridSearchCV
+from sklearn.model_selection import train_test_split, KFold, TimeSeriesSplit, RandomizedSearchCV, GridSearchCV
+from sklearn.metrics import root_mean_squared_error, mean_squared_error, r2_score, accuracy_score, mean_absolute_error, median_absolute_error
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from scipy import stats
 from scipy.stats import pearsonr, spearmanr
-import matplotlib.pyplot as plt
-import logging
-import lightgbm as lgb
+from dateutil.relativedelta import relativedelta
 from pyod.models.iforest import IForest
-import warnings
-from IPython.display import HTML
-sys.path.insert(1, 'MLpred')
-from MLpred import mlpred
-from MLpred import funcs
 from geopy.distance import geodesic
-import urllib.request
-import json
+from bs4 import BeautifulSoup
+from timezonefinder import TimezoneFinder
+import pytz
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.patches as mpatches
-import random
 from urllib.parse import urlencode
-from bs4 import BeautifulSoup
-import io
-from datetime import datetime, timedelta
-from timezonefinder import TimezoneFinder
-import pytz
+import urllib.request
+
+# IPython and display
+from IPython.display import HTML
+
+# Local imports
+sys.path.insert(1, 'MLpred')
+from MLpred import mlpred
+from MLpred import funcs
 
 warnings.filterwarnings("ignore")
 
@@ -511,8 +513,6 @@ class ObsSite:
             )
         self._lat = ilat if self._lat is None else self._lat
         self._lon = ilon if self._lon is None else self._lon
-        assert ilat == self._lat
-        assert ilon == self._lon
         self._name = iname if self._name is None else self._name
         if iname != self._name and not self._silent:
             print(
