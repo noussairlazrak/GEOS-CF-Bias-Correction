@@ -76,10 +76,7 @@ M2_TEMPLATE = "/home/ftei-dsw/Projects/SurfNO2/data/M2/{c}/small/*.{c}.%Y%m*.nc4
 M2_COLLECTIONS = ["tavg1_2d_flx_Nx", "tavg1_2d_lfo_Nx", "tavg1_2d_slv_Nx"]
 OPENAQ_TEMPLATE = "https://api.openaq.org/v2//measurements?date_from={Y1}-{M1}-01T00%3A00%3A00%2B00%3A00&date_to={Y2}-{M2}-01T00%3A00%3A00%2B00%3A00&limit=10000&page=1&offset=0&sort=asc&radius=1000&location_id={ID}&parameter={PARA}&order_by=datetime"
 
-# Look for `OPENAQ_API_KEY` in the environment. If it's set, use it. If not, 
-# fall back on "PUBLIC API" as a default (which will fail, but that's what it 
-# was set to before...).
-OPENAQAPI = os.environ.get("OPENAQ_API_KEY", "PUBLIC API")
+OPENAQAPI = os.environ.get("a0f1acb683b1f8e0e31e0328edebc95cafd4d9fa5c093c67fdbb63a6156d6b8b")
 MERRA2CNN = "https://aeronet.gsfc.nasa.gov/cgi-bin/web_print_air_quality_index"
 
 DEFAULT_GASES = ["co", "hcho", "no", "no2", "noy", "o3"]
