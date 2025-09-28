@@ -18,6 +18,7 @@ import random
 import io
 from math import sqrt
 from datetime import datetime, timedelta
+import datetime as dt
 import warnings
 
 # Third-party imports
@@ -76,7 +77,7 @@ M2_TEMPLATE = "/home/ftei-dsw/Projects/SurfNO2/data/M2/{c}/small/*.{c}.%Y%m*.nc4
 M2_COLLECTIONS = ["tavg1_2d_flx_Nx", "tavg1_2d_lfo_Nx", "tavg1_2d_slv_Nx"]
 OPENAQ_TEMPLATE = "https://api.openaq.org/v2//measurements?date_from={Y1}-{M1}-01T00%3A00%3A00%2B00%3A00&date_to={Y2}-{M2}-01T00%3A00%3A00%2B00%3A00&limit=10000&page=1&offset=0&sort=asc&radius=1000&location_id={ID}&parameter={PARA}&order_by=datetime"
 
-OPENAQAPI = os.environ.get("a0f1acb683b1f8e0e31e0328edebc95cafd4d9fa5c093c67fdbb63a6156d6b8b")
+OPENAQAPI = os.environ.get("ae1be41f0d6e6400a0ad67ccdb6bea912c7787a14038038d94dfc1b2044f7cd4")
 MERRA2CNN = "https://aeronet.gsfc.nasa.gov/cgi-bin/web_print_air_quality_index"
 
 DEFAULT_GASES = ["co", "hcho", "no", "no2", "noy", "o3"]
@@ -2243,19 +2244,27 @@ def read_merra2_cnn(base_url=MERRA2CNN, site=None, frequency=30, lat=None, lon=N
             if not silent:
                 print(f"Failed to fetch data for {date.strftime('%Y-%m-%d')}: {e}")
 
+    # If all_data is empty, fill with nulls for expected columns so it can merge with geos_cf
     if all_data.empty:
         if not silent:
-            print("No MERRA2 data retrieved. Returning empty DataFrame.")
-        return all_data
+            print("No MERRA2 data retrieved. Filling with nulls for merge.")
+        # Create a DataFrame with expected columns and nulls
+        all_data = pd.DataFrame({
+            'time': pd.date_range(start=start_date, end=end_date, freq='3H'),
+            'pm25_conc_cnn': [np.nan] * len(pd.date_range(start=start_date, end=end_date, freq='3H')),
+            'pm25_aqi': [np.nan] * len(pd.date_range(start=start_date, end=end_date, freq='3H')),
+            'Station': [None] * len(pd.date_range(start=start_date, end=end_date, freq='3H')),
+            'Site_Name': [None] * len(pd.date_range(start=start_date, end=end_date, freq='3H'))
+        })
 
-    # After all MERRA2 data is collected, request GEOS-CF
+
     if not silent:
         print("Requesting GEOS-CF...")
     geos_cf = read_geoscf(
         ilon=lon,
         ilat=lat,
-        start=all_data["time"].min(),
-        end=dt.datetime.today() + dt.timedelta(days=3),
+        start=datetime.today() - datetime.datetime.timedelta(days=30),
+        end=datetime.today() + datetime.datetime.timedelta(days=3),
         resample="3H",
         source="s3"
     )
@@ -2279,7 +2288,6 @@ def read_merra2_cnn(base_url=MERRA2CNN, site=None, frequency=30, lat=None, lon=N
             print(f"Saved output to {output_file}")
 
     return all_data
-
 
 
 def convert_no2_mol_m3_to_ppbv(no2_mol_m3, temperature_k, pressure_mbar):
@@ -2591,8 +2599,8 @@ def export_to_gesdisc(
     location_name=None,
     species=None,
     unit=None,
-    start=dt.datetime.today() - relativedelta(years=1),
-    end=dt.datetime.today(),
+    start=datetime.today() - relativedelta(years=1),
+    end=datetime.today(),
     lat=None,
     lon=None,
     IdentifierProductDOI=None,
