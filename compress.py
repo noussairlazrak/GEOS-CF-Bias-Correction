@@ -6,7 +6,7 @@ from timezonefinder import TimezoneFinder
 import pytz
 
 input_dirs = {
-    'precomputed/all_dts': 'no2'
+    'precomputed/all_dts'
 }
 output_file = 'precomputed/combined_forecasts.json.gz'
 
@@ -28,7 +28,7 @@ def parse_time(time_str):
 
 
 
-def process_directory(input_dir, species):
+def process_directory(input_dir):
     for filename in os.listdir(input_dir):
         if filename.endswith('.json'):
             filepath = os.path.join(input_dir, filename)
@@ -93,8 +93,8 @@ def process_directory(input_dir, species):
                 except json.JSONDecodeError:
                     print(f"Warning: Could not parse {filename}")
 
-for dir_path, species_name in input_dirs.items():
-    process_directory(dir_path, species_name)
+for dir_path in input_dirs:
+    process_directory(dir_path)
 
 with gzip.open(output_file, 'wt', encoding='utf-8') as out_file:
     json.dump(combined_data, out_file, indent=2)
