@@ -37,7 +37,7 @@ s3_bucket = "s3://smce-geos-cf-forecasts-oss-shared"
 #generting the forecasts routine
 for key, location_data in list(data.items()):
     #if str(key).lstrip("-").isdigit() and int(key) < -113 and "observation_source" in location_data:
-    if location_data.get("observation_source") in ("#DoS_Missions", "#NASA Pandora", "REMMAQ"):
+    if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "REMMAQ"):
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
         lat = location_data["lat"]
@@ -48,7 +48,7 @@ for key, location_data in list(data.items()):
             
             # Check if forecast is recent
             if funcs.is_forecast_recent(site_file_path, hours_threshold=5):
-                print(f"⏭️ Skipping {locname} - forecast generated within last 5 hours")
+                print(f"Skipping {locname} - forecast generated within last 5 hours")
                 continue
                 
             #generting the forecasts routine for GEOS FP CNN
@@ -78,7 +78,7 @@ for key, location_data in list(data.items()):
             
             # Check if forecast is recent
             if funcs.is_forecast_recent(file_path, hours_threshold=5):
-                print(f"⏭️ Skipping {locname} - forecast generated within last 5 hours")
+                print(f" Skipping {locname} - forecast generated within last 5 hours")
                 continue
             
             # Set source-specific parameters
