@@ -14,7 +14,7 @@ import boto3
 import traceback
 
 # S3 bucket and prefixes to check
-s3_bucket = "smce-geos-cf-forecasts-oss-shared"
+s3_bucket = "localized-forecasts"
 s3_prefixes = [
     "snwg_forecast_working_files/GEOS_CF/",
     "snwg_forecast_working_files/OPENAQ/",
@@ -33,7 +33,7 @@ data = json.loads(requests.get(url, stream=True).text)
 all_locations = []
 force_update = True 
 s3_client = boto3.client("s3")
-s3_bucket = "s3://smce-geos-cf-forecasts-oss-shared"
+s3_bucket = "s3://localized-forecasts"
 #generting the forecasts routine
 for key, location_data in list(data.items()):
     #if str(key).lstrip("-").isdigit() and int(key) < -113 and "observation_source" in location_data:
