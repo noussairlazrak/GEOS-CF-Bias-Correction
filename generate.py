@@ -33,10 +33,8 @@ data = json.loads(requests.get(url, stream=True).text)
 all_locations = []
 force_update = True 
 s3_client = boto3.client("s3")
-s3_bucket = "s3://smce-geos-cf-forecasts-oss-shared"
 #generting the forecasts routine
 for key, location_data in list(data.items()):
-    #if str(key).lstrip("-").isdigit() and int(key) < -113 and "observation_source" in location_data:
     if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "REMMAQ"):
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
@@ -86,15 +84,19 @@ for key, location_data in list(data.items()):
             if source_type == "NASA Pandora":
                 obs_src = 'pandora'
                 col_name = 'pandora'
-                time_col = 'time'
+                time_col = location_data["obs_options"]["no2"]["time_col"]
                 date_format = '%Y-%m-%d %H:%M'
-                obs_val_col = 'Raw Conc.'
+                obs_val_col = location_data["obs_options"]["no2"]["val_col"]
+                obs_url = f'{location_data["obs_options"]["no2"]["file"]}'
+                
+                
             else:  # REMMAQ
                 obs_src = 'local'
                 col_name = 'local'
                 time_col = location_data["obs_options"]["no2"]["time_col"]
                 date_format = location_data["obs_options"]["no2"]["time_parser"]
                 obs_val_col = location_data["obs_options"]["no2"]["val_col"]
+                obs_url = f'REMMAQ/{location_data["obs_options"]["no2"]["file"]}'
             
             try:
                 site_settings = {'l_name': locname, 
@@ -107,7 +109,7 @@ for key, location_data in list(data.items()):
                  'openaq_id': None,
                  'model_tuning' : False,
                  'model_url': '#',
-                 'obs_url': f'REMMAQ/{location_data["obs_options"]["no2"]["file"]}',
+                 'obs_url': obs_url,
                  'resample' : '1h',
                  'unit' : 'ppb',
                  'interpolation': True,
@@ -176,3 +178,4 @@ for key, location_data in list(data.items()):
             except Exception as e:
                 print(f"Error processing {source_type} location {key}: {e}")
                 traceback.print_exc()
+print("Forecast generation completed.")
