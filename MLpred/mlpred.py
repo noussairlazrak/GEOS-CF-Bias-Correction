@@ -53,6 +53,8 @@ import cartopy.feature as cfeature
 import matplotlib.patches as mpatches
 from urllib.parse import urlencode
 import urllib.request
+import boto3
+from botocore.exceptions import ClientError
 
 # IPython and display
 from IPython.display import HTML
@@ -77,7 +79,7 @@ M2_TEMPLATE = "/home/ftei-dsw/Projects/SurfNO2/data/M2/{c}/small/*.{c}.%Y%m*.nc4
 M2_COLLECTIONS = ["tavg1_2d_flx_Nx", "tavg1_2d_lfo_Nx", "tavg1_2d_slv_Nx"]
 OPENAQ_TEMPLATE = "https://api.openaq.org/v2//measurements?date_from={Y1}-{M1}-01T00%3A00%3A00%2B00%3A00&date_to={Y2}-{M2}-01T00%3A00%3A00%2B00%3A00&limit=10000&page=1&offset=0&sort=asc&radius=1000&location_id={ID}&parameter={PARA}&order_by=datetime"
 
-OPENAQAPI = os.environ.get("ae1be41f0d6e6400a0ad67ccdb6bea912c7787a14038038d94dfc1b2044f7cd4")
+OPENAQAPI = "ae1be41f0d6e6400a0ad67ccdb6bea912c7787a14038038d94dfc1b2044f7cd4"
 MERRA2CNN = "https://aeronet.gsfc.nasa.gov/cgi-bin/web_print_air_quality_index"
 
 DEFAULT_GASES = ["co", "hcho", "no", "no2", "noy", "o3"]
@@ -2260,14 +2262,16 @@ def read_merra2_cnn(base_url=MERRA2CNN, site=None, frequency=30, lat=None, lon=N
 
     if not silent:
         print("Requesting GEOS-CF...")
+
     geos_cf = read_geoscf(
         ilon=lon,
         ilat=lat,
-        start=datetime.today() - datetime.datetime.timedelta(days=30),
-        end=datetime.today() + datetime.datetime.timedelta(days=3),
+        start=datetime.today() - timedelta(days=30),
+        end=datetime.today() + timedelta(days=3),
         resample="3H",
         source="s3"
     )
+
     # Merge and process data
     merg = mlpred.merge_dataframes([all_data, geos_cf], "time", resample="3h", how="outer")
 
@@ -3688,13 +3692,13 @@ def read_geoscf(
             )
             df = ds.to_dataframe().reset_index()
             dfs.append(df)
-
+    
     elif source in ["zarr", "s3"]:
         SAVED_FILES_DIR = "GEOS_CF"
         os.makedirs(SAVED_FILES_DIR, exist_ok=True)
         location_name = f"loc_{ilat}_{ilon}".replace('.', '_').replace('-', 'm')
         csv_path = os.path.join(SAVED_FILES_DIR, f"{location_name}.csv")
-
+    
         force_full_download = False
         if os.path.exists(csv_path):
             if not silent:
@@ -3724,6 +3728,23 @@ def read_geoscf(
                 df_combined.to_csv(csv_path, index=False)
                 if not silent:
                     print(f" Updated CSV saved: {csv_path}")
+    
+                # --- S3 UPLOAD LOGIC START ---
+                s3_bucket_name = "smce-geos-cf-forecasts-oss-shared"
+                s3_key = f"snwg_forecast_working_files/GEOS_CF/{location_name}.csv"
+                s3_client = boto3.client("s3")
+                try:
+                    # Check S3 access
+                    s3_client.list_objects_v2(Bucket=s3_bucket_name, Prefix="snwg_forecast_working_files/GEOS_CF/", MaxKeys=1)
+                    if os.path.exists(csv_path):
+                        s3_client.upload_file(csv_path, s3_bucket_name, s3_key)
+                        print(f"✅ CSV uploaded to s3://{s3_bucket_name}/{s3_key}")
+                    else:
+                        print(f"❌ Local CSV {csv_path} does not exist, skipping S3 upload.")
+                except ClientError as e:
+                    print(f"❌ S3 access/upload failed: {e}")
+                # --- S3 UPLOAD LOGIC END ---
+    
                 df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
                 dfs.append(df_filtered)
             else:
@@ -3734,7 +3755,7 @@ def read_geoscf(
             if not silent:
                 print(" No CSV found. Will fetch full data.")
             force_full_download = True
-
+    
         if force_full_download:
             df_all = []
             sources = {
@@ -3763,6 +3784,22 @@ def read_geoscf(
                 df_combined.to_csv(csv_path, index=False)
                 if not silent:
                     print(f" Full dataset saved to {csv_path}")
+    
+                # --- S3 UPLOAD LOGIC START ---
+                s3_bucket_name = "smce-geos-cf-forecasts-oss-shared"
+                s3_key = f"snwg_forecast_working_files/GEOS_CF/{location_name}.csv"
+                s3_client = boto3.client("s3")
+                try:
+                    s3_client.list_objects_v2(Bucket=s3_bucket_name, Prefix="snwg_forecast_working_files/GEOS_CF/", MaxKeys=1)
+                    if os.path.exists(csv_path):
+                        s3_client.upload_file(csv_path, s3_bucket_name, s3_key)
+                        print(f"✅ CSV uploaded to s3://{s3_bucket_name}/{s3_key}")
+                    else:
+                        print(f"❌ Local CSV {csv_path} does not exist, skipping S3 upload.")
+                except ClientError as e:
+                    print(f"❌ S3 access/upload failed: {e}")
+                # --- S3 UPLOAD LOGIC END ---
+    
                 df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
                 dfs.append(df_filtered)
             else:
