@@ -79,7 +79,12 @@ M2_TEMPLATE = "/home/ftei-dsw/Projects/SurfNO2/data/M2/{c}/small/*.{c}.%Y%m*.nc4
 M2_COLLECTIONS = ["tavg1_2d_flx_Nx", "tavg1_2d_lfo_Nx", "tavg1_2d_slv_Nx"]
 OPENAQ_TEMPLATE = "https://api.openaq.org/v2//measurements?date_from={Y1}-{M1}-01T00%3A00%3A00%2B00%3A00&date_to={Y2}-{M2}-01T00%3A00%3A00%2B00%3A00&limit=10000&page=1&offset=0&sort=asc&radius=1000&location_id={ID}&parameter={PARA}&order_by=datetime"
 
+<<<<<<< HEAD
 OPENAQAPI = "ae1be41f0d6e6400a0ad67ccdb6bea912c7787a14038038d94dfc1b2044f7cd4"
+=======
+OPENAQAPI = os.environ.get("OPENAQ_API_KEY")
+# OPENAQAPI = "ae1be41f0d6e6400a0ad67ccdb6bea912c7787a14038038d94dfc1b2044f7cd4"
+>>>>>>> 38146abe89d8dcb26887faeba73e614de050b415
 MERRA2CNN = "https://aeronet.gsfc.nasa.gov/cgi-bin/web_print_air_quality_index"
 
 DEFAULT_GASES = ["co", "hcho", "no", "no2", "noy", "o3"]
