@@ -12,6 +12,21 @@ import requests
 import json
 import boto3
 import traceback
+import argparse
+
+# command-line arguments, options for openaq and plotting routine
+parser = argparse.ArgumentParser(description='Generate and upload forecasts to S3')
+parser.add_argument('--skip-plotting', action='store_true', default=False, help='Skip plot generation')
+parser.add_argument('--skip-openaq', action='store_true', default=False, help='Skip OpenAQ data retrieval')
+args = parser.parse_args()
+
+# Configuration
+SKIP_PLOTTING = args.skip_plotting
+SKIP_OPENAQ = args.skip_openaq
+SAVE_PLOTS_LOCAL = True
+UPLOAD_PLOTS_S3 = True
+FORECAST_HOURS_THRESHOLD = 5
+S3_PLOTS_PREFIX = "snwg_forecast_working_files/plots/"
 
 # S3 bucket and prefixes to check
 s3_bucket = "smce-geos-cf-forecasts-oss-shared"
@@ -24,11 +39,10 @@ s3_prefixes = [
 
 # Check S3 connectivity for all required prefixes
 funcs.check_s3_connectivity(s3_bucket, s3_prefixes)
-        
 
 #pulling location database
 url = "https://raw.githubusercontent.com/noussairlazrak/MLpred/refs/heads/main/global.json"
-print(url)
+print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}")
 data = json.loads(requests.get(url, stream=True).text)
 all_locations = []
 force_update = True 
@@ -45,8 +59,8 @@ for key, location_data in list(data.items()):
             site_file_path = f'./precomputed/all_dts/{site}.json'
             
             # Check if forecast is recent
-            if funcs.is_forecast_recent(site_file_path, hours_threshold=5):
-                print(f"Skipping {locname} - forecast generated within last 5 hours")
+            if funcs.is_forecast_recent(site_file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
+                print(f"Skipping {locname} - forecast generated within last {FORECAST_HOURS_THRESHOLD} hours")
                 continue
                 
             #generting the forecasts routine for GEOS FP CNN
@@ -75,8 +89,8 @@ for key, location_data in list(data.items()):
             file_path = f'./precomputed/all_dts/{locname}.json'
             
             # Check if forecast is recent
-            if funcs.is_forecast_recent(file_path, hours_threshold=5):
-                print(f" Skipping {locname} - forecast generated within last 5 hours")
+            if funcs.is_forecast_recent(file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
+                print(f"Skipping {locname} - forecast generated within last {FORECAST_HOURS_THRESHOLD} hours")
                 continue
             
             # Set source-specific parameters
@@ -141,10 +155,12 @@ for key, location_data in list(data.items()):
                 ]
 
                 print(sensors)
-                if sensors:
+                if sensors and not SKIP_OPENAQ:
                     aq_data = funcs.openaq_hourly_avgs(sensors, start, end)
                     if not aq_data.empty:
                         aq_df = pd.merge(aq_df, aq_data, on="time", how="outer")
+                elif SKIP_OPENAQ:
+                    print(f"⏭️ Skipping OpenAQ data retrieval (--skip-openaq flag set)")
 
                 fcast = fcast.set_index("time").reindex(hourly_index).reset_index().rename(columns={"index": "time"})
                 merg = mlpred.merge_dataframes([aq_df, fcast], "time", resample="1h", how="outer")
@@ -158,7 +174,46 @@ for key, location_data in list(data.items()):
 
                 merg_plot = merg.set_index("time").resample("5D").mean()
                 merg_plot = merg_plot.reset_index()
-                mlpred.gen_plot(merg_plot, [['no2','corrected', col_name,'avg']], [['black','grey', 'red','green']], [['--','-','-','-']], 'NO2', [f'{locname}'], sv_pth=f'./plots/{locname}.png' , resample='1D')
+                
+                # Plot generation with optional local save and S3 upload
+                if not SKIP_PLOTTING:
+                    try:
+                        local_plot_dir = "./plots"
+                        os.makedirs(local_plot_dir, exist_ok=True)
+                        local_plot_path = os.path.join(local_plot_dir, f"{locname}.png")
+                        
+                        mlpred.gen_plot(
+                            merg_plot,
+                            [['no2', 'corrected', col_name, 'avg']],
+                            [['black', 'grey', 'red', 'green']],
+                            [['--', '-', '-', '-']],
+                            'NO2',
+                            [f'{locname}'],
+                            sv_pth=local_plot_path,
+                            resample='1D'
+                        )
+                        print(f"Plot generated for {locname}")
+                        
+                        # Attempt upload to S3 if requested
+                        if UPLOAD_PLOTS_S3:
+                            try:
+                                s3_bucket_name = s3_bucket.replace("s3://", "")
+                                s3_key = os.path.join(S3_PLOTS_PREFIX, f"{locname}.png").replace("\\", "/")
+                                s3_client.upload_file(local_plot_path, s3_bucket_name, s3_key)
+                                print(f"Plot uploaded to s3://{s3_bucket_name}/{s3_key}")
+                            except Exception as upload_err:
+                                print(f"Failed to upload plot for {locname} to S3: {upload_err}")
+                        
+                        # Remove local copy if not requested
+                        if not SAVE_PLOTS_LOCAL:
+                            try:
+                                os.remove(local_plot_path)
+                                print(f"Local plot removed for {locname}")
+                            except Exception:
+                                pass
+                    except Exception as plot_err:
+                        print(f"Plot generation failed for {locname}: {plot_err}")
+                        traceback.print_exc()
 
                 cutoff = fcast["time"].max() - pd.DateOffset(months=12)
                 merg = merg[merg["time"] >= cutoff]
