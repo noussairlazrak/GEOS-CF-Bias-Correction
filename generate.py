@@ -18,14 +18,20 @@ import argparse
 parser = argparse.ArgumentParser(description='Generate and upload forecasts to S3')
 parser.add_argument('--skip-plotting', action='store_true', default=False, help='Skip plot generation')
 parser.add_argument('--skip-openaq', action='store_true', default=False, help='Skip OpenAQ data retrieval')
+parser.add_argument('--s3-only', action='store_true', default=False, help='Only upload to S3 (keeps local copies)')
+parser.add_argument('--clean-local', action='store_true', default=False, help='Remove local files after S3 upload')
+parser.add_argument('--no-local-save', action='store_true', default=False, help='Save directly to S3 without local files')
 args = parser.parse_args()
 
 # Configuration
 SKIP_PLOTTING = args.skip_plotting
 SKIP_OPENAQ = args.skip_openaq
+S3_ONLY = args.s3_only
+CLEAN_LOCAL = args.clean_local
+NO_LOCAL_SAVE = args.no_local_save
 SAVE_PLOTS_LOCAL = True
 UPLOAD_PLOTS_S3 = True
-FORECAST_HOURS_THRESHOLD = 5
+FORECAST_HOURS_THRESHOLD = 1
 S3_PLOTS_PREFIX = "snwg_forecast_working_files/plots/"
 
 # S3 bucket and prefixes to check
@@ -40,9 +46,23 @@ s3_prefixes = [
 # Check S3 connectivity for all required prefixes
 funcs.check_s3_connectivity(s3_bucket, s3_prefixes)
 
+# Create local directories (skip if NO_LOCAL_SAVE mode)
+if not NO_LOCAL_SAVE:
+    local_dirs = ["./precomputed/all_dts/", "./plots/"]
+    for local_dir in local_dirs:
+        os.makedirs(local_dir, exist_ok=True)
+        print(f"Directory ready: {local_dir}")
+else:
+    print(f"NO_LOCAL_SAVE mode enabled - saving directly to S3 without local files")
+
+if S3_ONLY:
+    print(f"S3_ONLY mode enabled - uploading to S3 (local copies will be kept by default)")
+if CLEAN_LOCAL:
+    print(f"CLEAN_LOCAL mode enabled - local files will be removed after S3 upload")
+
 #pulling location database
 url = "https://raw.githubusercontent.com/noussairlazrak/MLpred/refs/heads/main/global.json"
-print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}")
+print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}")
 data = json.loads(requests.get(url, stream=True).text)
 all_locations = []
 force_update = True 
@@ -58,8 +78,8 @@ for key, location_data in list(data.items()):
         if location_data["observation_source"] == "DoS_Missions":
             site_file_path = f'./precomputed/all_dts/{site}.json'
             
-            # Check if forecast is recent
-            if funcs.is_forecast_recent(site_file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
+            # Check if forecast is recent (only if saving locally)
+            if not NO_LOCAL_SAVE and funcs.is_forecast_recent(site_file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
                 print(f"Skipping {locname} - forecast generated within last {FORECAST_HOURS_THRESHOLD} hours")
                 continue
                 
@@ -75,10 +95,29 @@ for key, location_data in list(data.items()):
             try:
                 merra2cnn = mlpred.read_merra2_cnn(site=site, frequency = 10, lat = lat, lon = lon)
                 metadata = None
-                funcs.save_forecast_to_json(merra2cnn, metadata, site_settings=site_settings, species="pm25", sources=["merra2", "geoscf"], output_path=site_file_path)
-
-                # Upload to S3
-                funcs.upload_to_s3(site_file_path, s3_client, s3_bucket)
+                
+                if NO_LOCAL_SAVE:
+                    # Save directly to S3 without local file
+                    s3_bucket_name = s3_bucket.replace("s3://", "")
+                    s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{site}.json"
+                    if funcs.write_to_s3(merra2cnn, s3_client, s3_bucket_name, s3_key, data_format='json'):
+                        print(f"NO2 forecast for {locname} uploaded to S3")
+                    else:
+                        print(f"Warning: Failed to upload NO2 forecast for {locname} to S3")
+                else:
+                    funcs.save_forecast_to_json(merra2cnn, metadata, site_settings=site_settings, species="pm25", sources=["merra2", "geoscf"], output_path=site_file_path)
+                    # Upload to S3
+                    if funcs.upload_to_s3(site_file_path, s3_client, s3_bucket):
+                        print(f"NO2 forecast for {locname} uploaded to S3")
+                    
+                    # Clean up local file if requested
+                    if CLEAN_LOCAL:
+                        try:
+                            if os.path.exists(site_file_path):
+                                os.remove(site_file_path)
+                                print(f"Local file removed: {site_file_path}")
+                        except Exception:
+                            pass
             except Exception as e:
                 print(f"Error processing merra 2 forecasts in location {key}: {e}")
                 traceback.print_exc()
@@ -88,8 +127,8 @@ for key, location_data in list(data.items()):
             locname = location_data["location_name"]
             file_path = f'./precomputed/all_dts/{locname}.json'
             
-            # Check if forecast is recent
-            if funcs.is_forecast_recent(file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
+            # Check if forecast is recent (only if saving locally)
+            if not NO_LOCAL_SAVE and funcs.is_forecast_recent(file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
                 print(f"Skipping {locname} - forecast generated within last {FORECAST_HOURS_THRESHOLD} hours")
                 continue
             
@@ -160,7 +199,7 @@ for key, location_data in list(data.items()):
                     if not aq_data.empty:
                         aq_df = pd.merge(aq_df, aq_data, on="time", how="outer")
                 elif SKIP_OPENAQ:
-                    print(f"⏭️ Skipping OpenAQ data retrieval (--skip-openaq flag set)")
+                    print(f"Skipping OpenAQ data retrieval (--skip-openaq flag set)")
 
                 fcast = fcast.set_index("time").reindex(hourly_index).reset_index().rename(columns={"index": "time"})
                 merg = mlpred.merge_dataframes([aq_df, fcast], "time", resample="1h", how="outer")
@@ -194,8 +233,8 @@ for key, location_data in list(data.items()):
                         )
                         print(f"Plot generated for {locname}")
                         
-                        # Attempt upload to S3 if requested
-                        if UPLOAD_PLOTS_S3:
+                        # Upload to S3 if requested
+                        if not NO_LOCAL_SAVE or CLEAN_LOCAL:
                             try:
                                 s3_bucket_name = s3_bucket.replace("s3://", "")
                                 s3_key = os.path.join(S3_PLOTS_PREFIX, f"{locname}.png").replace("\\", "/")
@@ -204,11 +243,11 @@ for key, location_data in list(data.items()):
                             except Exception as upload_err:
                                 print(f"Failed to upload plot for {locname} to S3: {upload_err}")
                         
-                        # Remove local copy if not requested
-                        if not SAVE_PLOTS_LOCAL:
+                        # Remove local copy if requested
+                        if CLEAN_LOCAL or NO_LOCAL_SAVE:
                             try:
                                 os.remove(local_plot_path)
-                                print(f"Local plot removed for {locname}")
+                                print(f"Local plot removed: {locname}.png")
                             except Exception:
                                 pass
                     except Exception as plot_err:
@@ -225,10 +264,39 @@ for key, location_data in list(data.items()):
                 merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)
                 print(merg.columns)
 
-                funcs.save_forecast_to_json(merg, metadata, site_settings=site_settings, species="no2",sources=["geoscf", col_name], output_path=file_path)
+                if NO_LOCAL_SAVE:
+                    # Save directly to S3 without local file
+                    s3_bucket_name = s3_bucket.replace("s3://", "")
+                    s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{locname}.json"
+                    # Convert DataFrame to dict for S3 storage
+                    merg_dict = merg.to_dict(orient='records')
+                    forecast_dict = {
+                        "location": site_settings.get("l_name", "N/A"),
+                        "lat": site_settings.get("lat", "N/A"),
+                        "lon": site_settings.get("lon", "N/A"),
+                        "species": "no2",
+                        "sources": ["geoscf", col_name],
+                        "forecasts": merg_dict,
+                        "metadata": metadata
+                    }
+                    if funcs.write_to_s3(forecast_dict, s3_client, s3_bucket_name, s3_key, data_format='json'):
+                        print(f"NO2 forecast for {locname} uploaded to S3")
+                    else:
+                        print(f"Warning: Failed to upload NO2 forecast for {locname} to S3")
+                else:
+                    funcs.save_forecast_to_json(merg, metadata, site_settings=site_settings, species="no2",sources=["geoscf", col_name], output_path=file_path)
 
-                # Upload to S3
-                funcs.upload_to_s3(file_path, s3_client, s3_bucket)
+                    # Upload to S3
+                    if funcs.upload_to_s3(file_path, s3_client, s3_bucket):
+                        print(f"NO2 forecast for {locname} uploaded to S3")
+                    
+                    if CLEAN_LOCAL:
+                        try:
+                            if os.path.exists(file_path):
+                                os.remove(file_path)
+                                print(f"Local file removed: {file_path}")
+                        except Exception:
+                            pass
 
             except Exception as e:
                 print(f"Error processing {source_type} location {key}: {e}")

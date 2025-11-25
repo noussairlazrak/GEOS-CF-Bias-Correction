@@ -940,11 +940,16 @@ def upload_to_s3(file_path, s3_client, s3_bucket):
         S3 client instance
     s3_bucket : str
         S3 bucket URI (s3:// prefix optional)
+        
+    Returns
+    -------
+    bool
+        True if upload successful, False otherwise
     """
     try:
         if not os.path.exists(file_path):
             print(f"File {file_path} does not exist. Skipping S3 upload.")
-            return
+            return False
         
         s3_bucket_name = s3_bucket.replace("s3://", "")
         s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{os.path.basename(file_path)}"
@@ -952,9 +957,47 @@ def upload_to_s3(file_path, s3_client, s3_bucket):
         try:
             s3_client.upload_file(file_path, s3_bucket_name, s3_key)
             print(f"Successfully uploaded to s3://{s3_bucket_name}/{s3_key}")
+            return True
         except (OSError, IOError) as e:
             print(f"File read error uploading {file_path}: {e}")
+            return False
         except Exception as err:
             print(f"Failed to upload {file_path} to S3: {err}")
+            return False
     except Exception as e:
         print(f"Unexpected error in upload_to_s3: {e}")
+        return False
+
+def write_to_s3(data, s3_client, bucket, s3_key, data_format='json'):
+    """
+    Save data directly to S3 without creating local files.
+    
+    Parameters
+    ----------
+    data : dict or DataFrame
+        Data to save
+    s3_client : boto3.client
+        S3 client instance
+    bucket : str
+        S3 bucket name (without s3:// prefix)
+    s3_key : str
+        S3 key (path within bucket)
+    data_format : str
+        Format to save ('json' or 'csv')
+    """
+    try:
+        bucket_name = bucket.replace("s3://", "")
+        
+        if data_format == 'json':
+            import json
+            json_data = json.dumps(data, default=str, indent=2)
+            s3_client.put_object(Bucket=bucket_name, Key=s3_key, Body=json_data)
+        elif data_format == 'csv':
+            csv_buffer = data.to_csv(index=False)
+            s3_client.put_object(Bucket=bucket_name, Key=s3_key, Body=csv_buffer)
+        
+        print(f"Data saved directly to s3://{bucket_name}/{s3_key}")
+        return True
+    except Exception as e:
+        print(f"Failed to save to S3: {e}")
+        return False
