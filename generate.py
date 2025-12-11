@@ -21,6 +21,7 @@ parser.add_argument('--skip-openaq', action='store_true', default=False, help='S
 parser.add_argument('--s3-only', action='store_true', default=False, help='Only upload to S3 (keeps local copies)')
 parser.add_argument('--clean-local', action='store_true', default=False, help='Remove local files after S3 upload')
 parser.add_argument('--no-local-save', action='store_true', default=False, help='Save directly to S3 without local files')
+parser.add_argument('--model-cache', choices=['local', 's3'], default='s3', help='Store model CSV cache locally or on S3 (default: s3)')
 args = parser.parse_args()
 
 # Configuration
@@ -33,6 +34,11 @@ SAVE_PLOTS_LOCAL = True
 UPLOAD_PLOTS_S3 = True
 FORECAST_HOURS_THRESHOLD = 1
 S3_PLOTS_PREFIX = "snwg_forecast_working_files/plots/"
+
+# Model CSV cache configuration - choose storage location for model data
+# Use --model-cache local or --model-cache s3 to control
+MODEL_CACHE_SOURCE = args.model_cache  # "local" or "s3"
+S3_MODEL_CACHE_PREFIX = "snwg_forecast_working_files/GEOS_CF/"
 
 # S3 bucket and prefixes to check
 s3_bucket = "smce-geos-cf-forecasts-oss-shared"
@@ -62,7 +68,7 @@ if CLEAN_LOCAL:
 
 #pulling location database
 url = "https://raw.githubusercontent.com/noussairlazrak/MLpred/refs/heads/main/global.json"
-print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}")
+print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}")
 data = json.loads(requests.get(url, stream=True).text)
 all_locations = []
 force_update = True 
@@ -178,7 +184,15 @@ for key, location_data in list(data.items()):
                                      'remove_outlier': False,
                                     }
 
-                forecasts_raw, metadata = mlpred.get_localised_forecast(site_settings=site_settings, obs_settings=obs_settings)
+                # Pass S3 parameters for model caching
+                forecasts_raw, metadata = mlpred.get_localised_forecast(
+                    site_settings=site_settings, 
+                    obs_settings=obs_settings,
+                    model_cache_source=MODEL_CACHE_SOURCE,
+                    s3_client=s3_client,
+                    s3_bucket=s3_bucket.replace("s3://", ""),
+                    s3_prefix=S3_MODEL_CACHE_PREFIX
+                )
                 col_map = {"time": "time", "no2": "no2", "localised": "corrected", "value": col_name}
                 fcast = forecasts_raw[["time", "no2", "localised", "value", "o3", "pm25_rh35_gcc", "rh","t10m","tprec","hcho"]].rename(columns=col_map)
                 fcast.iloc[:, 1:] = fcast.iloc[:, 1:].clip(lower=0)

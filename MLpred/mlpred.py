@@ -20,7 +20,6 @@ from math import sqrt
 from datetime import datetime, timedelta
 import datetime as dt
 import warnings
-
 # Third-party imports
 import numpy as np
 import pandas as pd
@@ -852,10 +851,10 @@ class ObsSite:
                 print("Warning: cannot merge because mod or obs is None")
             return None
         
-        # Toss model variables that are blacklisted.
+        # Toss model variables in blacklist
         ivars = [i for i in self._mod.columns if i not in mod_blacklist]
         
-        # Merge model data with observation data on time
+        # Merge all data
         mdat = (
             self._mod[ivars]
             .merge(self._obs, on=["time"], how="outer")
@@ -865,17 +864,17 @@ class ObsSite:
         mdat = mdat.drop_duplicates(subset='time')
         mdat = mdat.sort_values(by='time')
 
-        # Interpolate if interpolation is enabled
+        # Interpolate
         if interpolation:
             idat = mdat.set_index("time").interpolate(method="slinear").reset_index()
         else:
             idat = mdat
 
         # Resample to 1-hour intervals
-        idat.set_index("time", inplace=True)  # Set time as index for resampling
-        idat_resampled = idat.resample('1H').mean(numeric_only=True).reset_index()  # Resample and reset index
+        idat.set_index("time", inplace=True)
+        idat_resampled = idat.resample('1H').mean(numeric_only=True).reset_index()
 
-        # Filter by the provided start and end times, if specified
+        # Filter by the provided start and end times
         if start is not None:
             idat_resampled = idat_resampled[idat_resampled['time'] >= pd.to_datetime(start)]
         
@@ -994,32 +993,56 @@ class ObsSite:
 
 
         if source in ["zarr", "s3"]:
-            location_name = "washignton"
+            location_name = "loc_{:.2f}_{:.2f}".format(ilat, ilon).replace('.', '_').replace('-', 'm')
             
-            SAVED_FILES_DIR = "GEOS_CF"
-            os.makedirs(SAVED_FILES_DIR, exist_ok=True)
-
+            # Determine storage source and parameters
+            model_cache_source = kwargs.get('model_cache_source', 'local')
+            s3_client = kwargs.get('s3_client', None)
+            s3_bucket = kwargs.get('s3_bucket', None)
+            s3_prefix = kwargs.get('s3_prefix', 'snwg_forecast_working_files/GEOS_CF/')
+            
+            # Setup local or S3 storage
+            if model_cache_source == 's3':
+                if not s3_client or not s3_bucket:
+                    print("S3 cache requested but S3 client/bucket not provided. Falling back to local cache.")
+                    model_cache_source = 'local'
+            
+            if model_cache_source == 'local':
+                SAVED_FILES_DIR = "GEOS_CF"
+                os.makedirs(SAVED_FILES_DIR, exist_ok=True)
+            
             base_start = datetime(2018, 1, 1)
             base_end = (datetime.today() + timedelta(days=5)).date()
             location_name = f"loc_{ilat}_{ilon}".replace('.', '_').replace('-', 'm') 
-            csv_path = os.path.join(SAVED_FILES_DIR, f"{location_name}.csv")
+            
+            if model_cache_source == 'local':
+                csv_path = os.path.join(SAVED_FILES_DIR, f"{location_name}.csv")
+            else:
+                csv_path = None  
 
 
             force_full_download = False
 
+            # Try to load existing cache
+            if model_cache_source == 'local':
+                df_existing = None
+                if os.path.exists(csv_path):
+                    print(f"Found existing CSV for {location_name}. Checking time coverage...")
+                    df_existing = pd.read_csv(csv_path, parse_dates=["time"])
+            else:  # S3
+                if funcs.check_model_csv_exists_s3(s3_client, s3_bucket, s3_prefix, location_name):
+                    print(f"Found existing S3 CSV for {location_name}. Checking time coverage...")
+                    df_existing = funcs.read_model_csv_from_s3(s3_client, s3_bucket, s3_prefix, location_name)
+                else:
+                    df_existing = None
 
-            if os.path.exists(csv_path):
-                print(f"📂 Found existing CSV for {location_name}. Checking time coverage...")
-                df_existing = pd.read_csv(csv_path, parse_dates=["time"])
-
+            if df_existing is not None:
                 t_min = df_existing["time"].min().date()
                 t_max = df_existing["time"].max().date()
-
 
                 if t_min <= base_start.date():
                     print("CSV has historical data. Will only fetch forecast data.")
                     df_all = [df_existing]
-
 
                     try:
                         ipath_fc = fsspec.get_mapper(S3_FORECASTS_TEMPLATE)
@@ -1034,15 +1057,17 @@ class ObsSite:
                         df_all.append(df_fc)
 
                     except Exception as e:
-                        print(f"⚠ Error reading forecast data: {e}")
-
+                        print(f"Error reading forecast data: {e}")
 
                     df_combined = pd.concat(df_all, ignore_index=True)
                     df_combined = df_combined.drop_duplicates(subset="time").sort_values("time")
 
-
-                    df_combined.to_csv(csv_path, index=False)
-                    print(f" Updated CSV saved: {csv_path}")
+                    # Save to cache (local or S3)
+                    if model_cache_source == 'local':
+                        df_combined.to_csv(csv_path, index=False)
+                        print(f"Updated CSV saved: {csv_path}")
+                    else:  # S3
+                        funcs.save_model_csv_to_s3(df_combined, s3_client, s3_bucket, s3_prefix, location_name)
 
                     df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
                     dfs.append(df_filtered)
@@ -1052,7 +1077,7 @@ class ObsSite:
                     force_full_download = True
 
             else:
-                print(" No CSV found. Will fetch full data.")
+                print("No CSV found. Will fetch full data.")
                 force_full_download = True
 
             if force_full_download:
@@ -1078,14 +1103,18 @@ class ObsSite:
                         df_all.append(df)
 
                     except Exception as e:
-                        print(f"⚠ Error reading {label}: {e}")
+                        print(f"Error reading {label}: {e}")
 
                 if df_all:
                     df_combined = pd.concat(df_all, ignore_index=True)
                     df_combined = df_combined.drop_duplicates(subset="time").sort_values("time")
 
-                    df_combined.to_csv(csv_path, index=False)
-                    print(f" Full dataset saved to {csv_path}")
+                    # Save to cache (local or S3)
+                    if model_cache_source == 'local':
+                        df_combined.to_csv(csv_path, index=False)
+                        print(f"Full dataset saved to {csv_path}")
+                    else:  # S3
+                        funcs.save_model_csv_to_s3(df_combined, s3_client, s3_bucket, s3_prefix, location_name)
 
                     df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
                     dfs.append(df_filtered)
@@ -1797,6 +1826,10 @@ def get_localised_forecast(**kwargs):
         end=dt.datetime.today() + dt.timedelta(days=7),
         source=model_source,
         url=GEOS_CF,
+        model_cache_source=kwargs.get('model_cache_source', 'local'),
+        s3_client=kwargs.get('s3_client', None),
+        s3_bucket=kwargs.get('s3_bucket', None),
+        s3_prefix=kwargs.get('s3_prefix', 'snwg_forecast_working_files/GEOS_CF/'),
     )
     model_data["time"] = [
         dt.datetime(i.year, i.month, i.day, i.hour, 0, 0) for i in model_data["time"]
@@ -3703,7 +3736,7 @@ def read_geoscf(
         force_full_download = False
         if os.path.exists(csv_path):
             if not silent:
-                print(f"📂 Found existing CSV for {location_name}. Checking time coverage...")
+                print(f"Found existing CSV for {location_name}. Checking time coverage...")
             df_existing = pd.read_csv(csv_path, parse_dates=["time"])
             t_min = df_existing["time"].min().date()
             base_start = datetime(2018, 1, 1).date()
@@ -3723,7 +3756,7 @@ def read_geoscf(
                     df_fc["time"] = pd.to_datetime(df_fc["time"])
                     df_all.append(df_fc)
                 except Exception as e:
-                    print(f"⚠ Error reading forecast data: {e}")
+                    print(f"Error reading forecast data: {e}")
                 df_combined = pd.concat(df_all, ignore_index=True)
                 df_combined = df_combined.drop_duplicates(subset="time").sort_values("time")
                 df_combined.to_csv(csv_path, index=False)
@@ -3739,11 +3772,11 @@ def read_geoscf(
                     s3_client.list_objects_v2(Bucket=s3_bucket_name, Prefix="snwg_forecast_working_files/GEOS_CF/", MaxKeys=1)
                     if os.path.exists(csv_path):
                         s3_client.upload_file(csv_path, s3_bucket_name, s3_key)
-                        print(f"✅ CSV uploaded to s3://{s3_bucket_name}/{s3_key}")
+                        print(f"CSV uploaded to s3://{s3_bucket_name}/{s3_key}")
                     else:
-                        print(f"❌ Local CSV {csv_path} does not exist, skipping S3 upload.")
+                        print(f"Local CSV {csv_path} does not exist, skipping S3 upload.")
                 except ClientError as e:
-                    print(f"❌ S3 access/upload failed: {e}")
+                    print(f"S3 access/upload failed: {e}")
                 # --- S3 UPLOAD LOGIC END ---
     
                 df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
@@ -3778,7 +3811,7 @@ def read_geoscf(
                     df["time"] = pd.to_datetime(df["time"])
                     df_all.append(df)
                 except Exception as e:
-                    print(f"⚠ Error reading {label}: {e}")
+                    print(f"Error reading {label}: {e}")
             if df_all:
                 df_combined = pd.concat(df_all, ignore_index=True)
                 df_combined = df_combined.drop_duplicates(subset="time").sort_values("time")

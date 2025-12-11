@@ -2,6 +2,7 @@ import json
 import math
 import os
 import re
+import io
 from datetime import datetime, timedelta
 
 import boto3
@@ -1000,4 +1001,111 @@ def write_to_s3(data, s3_client, bucket, s3_key, data_format='json'):
         return True
     except Exception as e:
         print(f"Failed to save to S3: {e}")
+        return False
+
+def save_model_csv_to_s3(df, s3_client, bucket_name, s3_prefix, location_name):
+    """Save model DataFrame to S3 as CSV.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Model data to save
+    s3_client : boto3.client
+        S3 client
+    bucket_name : str
+        S3 bucket name (without s3:// prefix)
+    s3_prefix : str
+        S3 prefix/folder (e.g., "snwg_forecast_working_files/GEOS_CF/")
+    location_name : str
+        Location identifier for the filename
+        
+    Returns
+    -------
+    bool
+        True if successful, False otherwise
+    """
+    try:
+        s3_key = f"{s3_prefix}{location_name}.csv"
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False)
+        csv_buffer.seek(0)
+        
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=csv_buffer.getvalue()
+        )
+        print(f"✓ Model CSV saved to s3://{bucket_name}/{s3_key}")
+        return True
+    except Exception as e:
+        print(f"✗ Failed to save model CSV to S3: {e}")
+        return False
+
+
+def read_model_csv_from_s3(s3_client, bucket_name, s3_prefix, location_name):
+    """Read model DataFrame from S3.
+    
+    Parameters
+    ----------
+    s3_client : boto3.client
+        S3 client
+    bucket_name : str
+        S3 bucket name (without s3:// prefix)
+    s3_prefix : str
+        S3 prefix/folder (e.g., "snwg_forecast_working_files/GEOS_CF/")
+    location_name : str
+        Location identifier for the filename
+        
+    Returns
+    -------
+    pd.DataFrame or None
+        DataFrame if successful, None otherwise
+    """
+    try:
+        s3_key = f"{s3_prefix}{location_name}.csv"
+        response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+        df = pd.read_csv(response['Body'], parse_dates=['time'])
+        print(f"✓ Model CSV loaded from s3://{bucket_name}/{s3_key}")
+        return df
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            # File doesn't exist yet, which is normal
+            return None
+        else:
+            print(f"✗ Error reading model CSV from S3: {e}")
+            return None
+    except Exception as e:
+        print(f"✗ Error reading model CSV from S3: {e}")
+        return None
+
+
+def check_model_csv_exists_s3(s3_client, bucket_name, s3_prefix, location_name):
+    """Check if model CSV exists in S3.
+    
+    Parameters
+    ----------
+    s3_client : boto3.client
+        S3 client
+    bucket_name : str
+        S3 bucket name (without s3:// prefix)
+    s3_prefix : str
+        S3 prefix/folder (e.g., "snwg_forecast_working_files/GEOS_CF/")
+    location_name : str
+        Location identifier for the filename
+        
+    Returns
+    -------
+    bool
+        True if exists, False otherwise
+    """
+    try:
+        s3_key = f"{s3_prefix}{location_name}.csv"
+        s3_client.head_object(Bucket=bucket_name, Key=s3_key)
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return False
+        else:
+            return False
+    except Exception:
         return False
