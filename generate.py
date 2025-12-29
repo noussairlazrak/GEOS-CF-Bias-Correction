@@ -14,7 +14,7 @@ import boto3
 import traceback
 import argparse
 
-# command-line arguments, options for openaq and plotting routine
+# command-line arguments
 parser = argparse.ArgumentParser(description='Generate and upload forecasts to S3')
 parser.add_argument('--skip-plotting', action='store_true', default=False, help='Skip plot generation')
 parser.add_argument('--skip-openaq', action='store_true', default=False, help='Skip OpenAQ data retrieval')
@@ -35,8 +35,9 @@ UPLOAD_PLOTS_S3 = True
 FORECAST_HOURS_THRESHOLD = 1
 S3_PLOTS_PREFIX = "snwg_forecast_working_files/plots/"
 
-# Model CSV cache configuration - choose storage location for model data
+# Model CSV cache configuration 
 # Use --model-cache local or --model-cache s3 to control
+s3_client = boto3.client("s3")
 MODEL_CACHE_SOURCE = args.model_cache  # "local" or "s3"
 S3_MODEL_CACHE_PREFIX = "snwg_forecast_working_files/GEOS_CF/"
 
@@ -52,7 +53,7 @@ s3_prefixes = [
 # Check S3 connectivity for all required prefixes
 funcs.check_s3_connectivity(s3_bucket, s3_prefixes)
 
-# Create local directories (skip if NO_LOCAL_SAVE mode)
+# Create local directories (skip if NO_LOCAL_SAVE)
 if not NO_LOCAL_SAVE:
     local_dirs = ["./precomputed/all_dts/", "./plots/"]
     for local_dir in local_dirs:
@@ -72,10 +73,9 @@ print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONL
 data = json.loads(requests.get(url, stream=True).text)
 all_locations = []
 force_update = True 
-s3_client = boto3.client("s3")
 #generting the forecasts routine
 for key, location_data in list(data.items()):
-    if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "REMMAQ"):
+    if location_data.get("observation_source") in ("#DoS_Missions", "NASA Pandora", "#REMMAQ"):
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
         lat = location_data["lat"]
@@ -157,6 +157,7 @@ for key, location_data in list(data.items()):
                 obs_val_col = location_data["obs_options"]["no2"]["val_col"]
                 obs_url = f'REMMAQ/{location_data["obs_options"]["no2"]["file"]}'
             
+            print(f"Using observation source: {obs_src} for {locname}")
             try:
                 site_settings = {'l_name': locname, 
                  'species': 'no2', 
@@ -183,18 +184,40 @@ for key, location_data in list(data.items()):
                                      'lon_col': None,
                                      'remove_outlier': False,
                                     }
-
-                # Pass S3 parameters for model caching
-                forecasts_raw, metadata = mlpred.get_localised_forecast(
-                    site_settings=site_settings, 
-                    obs_settings=obs_settings,
-                    model_cache_source=MODEL_CACHE_SOURCE,
-                    s3_client=s3_client,
-                    s3_bucket=s3_bucket.replace("s3://", ""),
-                    s3_prefix=S3_MODEL_CACHE_PREFIX
+                merged_data, metrics, model = mlpred.get_localised_forecast(
+                    loc=site_settings['l_name'],
+                    spec=site_settings['species'],
+                    lat=site_settings['lat'],
+                    lon=site_settings['lon'],
+                    mod_src=site_settings['model_src'],
+                    obs_src=site_settings['obs_src'],
+                    openaq_id=site_settings['openaq_id'],
+                    GEOS_CF=site_settings['model_url'],
+                    OBS_URL=site_settings['obs_url'],
+                    st=site_settings['start'],
+                    ed=site_settings['end'],
+                    resamp=site_settings['resample'],
+                    unit=site_settings['unit'],
+                    interpol=site_settings['interpolation'],
+                    rmv_out=site_settings['remove_outlier'],
+                    time_col=obs_settings['time_col'],
+                    date_fmt=obs_settings['date_format'],
+                    obs_val_col=obs_settings['obs_val_col'],
+                    lat_col=obs_settings['lat_col'],
+                    lon_col=obs_settings['lon_col'],
+                    silent=site_settings['silent'],
+                    force_retrain=True
                 )
+                # Upload model to S3
+                funcs.upload_model_to_s3(model, site_settings['l_name'], site_settings['species'], s3_client=s3_client)
+                if merged_data is None:
+                    print(f"[ERROR] Bias correction failed for {locname}")
+                    continue
+                # Use merged_data 
+                forecasts_raw = merged_data
+                metadata = metrics
                 col_map = {"time": "time", "no2": "no2", "localised": "corrected", "value": col_name}
-                fcast = forecasts_raw[["time", "no2", "localised", "value", "o3", "pm25_rh35_gcc", "rh","t10m","tprec","hcho"]].rename(columns=col_map)
+                fcast = forecasts_raw[[c for c in ["time", "no2", "localised", "value", "o3", "pm25_rh35_gcc", "rh","t10m","tprec","hcho"] if c in forecasts_raw.columns]].rename(columns=col_map)
                 fcast.iloc[:, 1:] = fcast.iloc[:, 1:].clip(lower=0)
 
                 start, end = fcast["time"].min(), fcast["time"].max()
@@ -216,7 +239,7 @@ for key, location_data in list(data.items()):
                     print(f"Skipping OpenAQ data retrieval (--skip-openaq flag set)")
 
                 fcast = fcast.set_index("time").reindex(hourly_index).reset_index().rename(columns={"index": "time"})
-                merg = mlpred.merge_dataframes([aq_df, fcast], "time", resample="1h", how="outer")
+                merg = funcs.merge_dataframes([aq_df, fcast], "time", resample="1h", how="outer")
 
                 for col in ["no2", "corrected", col_name, "avg"]:
                     merg[col] = merg.get(col, np.nan)
@@ -228,14 +251,14 @@ for key, location_data in list(data.items()):
                 merg_plot = merg.set_index("time").resample("5D").mean()
                 merg_plot = merg_plot.reset_index()
                 
-                # Plot generation with optional local save and S3 upload
+                # Plot generation
                 if not SKIP_PLOTTING:
                     try:
                         local_plot_dir = "./plots"
                         os.makedirs(local_plot_dir, exist_ok=True)
                         local_plot_path = os.path.join(local_plot_dir, f"{locname}.png")
                         
-                        mlpred.gen_plot(
+                        funcs.gen_plot(
                             merg_plot,
                             [['no2', 'corrected', col_name, 'avg']],
                             [['black', 'grey', 'red', 'green']],
@@ -247,7 +270,7 @@ for key, location_data in list(data.items()):
                         )
                         print(f"Plot generated for {locname}")
                         
-                        # Upload to S3 if requested
+                        # Upload to S3 
                         if not NO_LOCAL_SAVE or CLEAN_LOCAL:
                             try:
                                 s3_bucket_name = s3_bucket.replace("s3://", "")
@@ -257,7 +280,7 @@ for key, location_data in list(data.items()):
                             except Exception as upload_err:
                                 print(f"Failed to upload plot for {locname} to S3: {upload_err}")
                         
-                        # Remove local copy if requested
+                        # Remove local
                         if CLEAN_LOCAL or NO_LOCAL_SAVE:
                             try:
                                 os.remove(local_plot_path)
@@ -270,7 +293,7 @@ for key, location_data in list(data.items()):
 
                 cutoff = fcast["time"].max() - pd.DateOffset(months=12)
                 merg = merg[merg["time"] >= cutoff]
-                merg = mlpred.convert_times_column(merg, 'time', lat, lon)
+                merg = funcs.convert_times_column(merg, 'time', lat, lon)
                 
                 species_map = { 'PM2.5': 'pm25_rh35_gcc', 'NO2': 'corrected', 'O3': 'o3' } 
                 avg_hours = { 'NO2': 3, 'O3': 1 }
@@ -279,10 +302,10 @@ for key, location_data in list(data.items()):
                 print(merg.columns)
 
                 if NO_LOCAL_SAVE:
-                    # Save directly to S3 without local file
+                    # Save directly to S3
                     s3_bucket_name = s3_bucket.replace("s3://", "")
                     s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{locname}.json"
-                    # Convert DataFrame to dict for S3 storage
+                    # Convert DataFrame
                     merg_dict = merg.to_dict(orient='records')
                     forecast_dict = {
                         "location": site_settings.get("l_name", "N/A"),
@@ -291,6 +314,7 @@ for key, location_data in list(data.items()):
                         "species": "no2",
                         "sources": ["geoscf", col_name],
                         "forecasts": merg_dict,
+                        "metrics": metadata,
                         "metadata": metadata
                     }
                     if funcs.write_to_s3(forecast_dict, s3_client, s3_bucket_name, s3_key, data_format='json'):
@@ -299,11 +323,19 @@ for key, location_data in list(data.items()):
                         print(f"Warning: Failed to upload NO2 forecast for {locname} to S3")
                 else:
                     funcs.save_forecast_to_json(merg, metadata, site_settings=site_settings, species="no2",sources=["geoscf", col_name], output_path=file_path)
-
+                    # Adding metrics to the saved JSON file
+                    # Reload, update, and re-save with metrics
+                    try:
+                        with open(file_path, 'r') as f:
+                            forecast_json = json.load(f)
+                        forecast_json['metrics'] = metadata
+                        with open(file_path, 'w') as f:
+                            json.dump(forecast_json, f, indent=2, default=str)
+                    except Exception as e:
+                        print(f"Warning: Could not add metrics to local JSON for {locname}: {e}")
                     # Upload to S3
                     if funcs.upload_to_s3(file_path, s3_client, s3_bucket):
-                        print(f"NO2 forecast for {locname} uploaded to S3")
-                    
+                        print(f"no2 forecast for {locname} uploaded to S3")
                     if CLEAN_LOCAL:
                         try:
                             if os.path.exists(file_path):

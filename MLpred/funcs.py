@@ -4,7 +4,8 @@ import os
 import re
 import io
 from datetime import datetime, timedelta
-
+from timezonefinder import TimezoneFinder
+import pytz
 import boto3
 import numpy as np
 import pandas as pd
@@ -12,7 +13,7 @@ import plotly.express as px
 import requests
 from botocore.exceptions import ClientError
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
+import datetime as dt
 from MLpred import mlpred
 
 
@@ -855,6 +856,56 @@ def calculate_nowcast(df, species_columns=None, avg_hours=None):
     except Exception as e:
         print(f"Error in calculate_nowcast: {e}")
         return df if 'df' in locals() else pd.DataFrame()
+    
+def log_if_condition(condition, message, log_file="logs/locations_log.txt"):
+    """Log management routine"""
+    try:
+        if condition:
+            current_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            with open(log_file, "a") as log:
+                log.write(f"{current_time} - {message}\n")
+    except Exception as e:
+        print(f"Error occurred while logging: {e}")
+
+        
+def clean_data(X, Y):
+    valid_idx = ~(np.isnan(Y) | np.isinf(Y))  
+    return X[valid_idx], Y[valid_idx]
+
+def clean_feature_names(df):
+    df.columns = [re.sub(r'[^\w]', '_', str(col)) for col in df.columns] 
+    return df
+
+
+def convert_times_column(df, time_column, lat, lon):
+    tf = TimezoneFinder()
+    tz_str = tf.timezone_at(lat=lat, lng=lon)
+    if tz_str is None:
+        tz_str = 'UTC'
+    tz = pytz.timezone(tz_str)
+
+    def to_local(t):
+        if t.tzinfo is None:
+            t = pytz.utc.localize(t)
+        else:
+            t = t.astimezone(pytz.utc)
+        return t.astimezone(tz)
+
+    df['local_time'] = df[time_column].apply(to_local)
+    df['timezone'] = tz_str
+    return df
+
+def merge_dataframes(df_list, index_col, resample=None, how= 'outer'):
+    """merge data routine"""
+    merged_df = df_list[0]
+    for df in df_list[1:]:
+        merged_df = pd.merge(merged_df, df, on=index_col, how=how)
+    if resample:
+        numeric_cols = merged_df.select_dtypes(include='number').columns.tolist()
+        merged_df = merged_df.resample(resample, on=index_col)[numeric_cols].mean().reset_index()
+    return merged_df
+
 
 def is_forecast_recent(file_path, hours_threshold=5):
     """
@@ -1035,10 +1086,10 @@ def save_model_csv_to_s3(df, s3_client, bucket_name, s3_prefix, location_name):
             Key=s3_key,
             Body=csv_buffer.getvalue()
         )
-        print(f"✓ Model CSV saved to s3://{bucket_name}/{s3_key}")
+        print(f"Model CSV saved to s3://{bucket_name}/{s3_key}")
         return True
     except Exception as e:
-        print(f"✗ Failed to save model CSV to S3: {e}")
+        print(f"Failed to save model CSV to S3: {e}")
         return False
 
 
@@ -1065,17 +1116,17 @@ def read_model_csv_from_s3(s3_client, bucket_name, s3_prefix, location_name):
         s3_key = f"{s3_prefix}{location_name}.csv"
         response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
         df = pd.read_csv(response['Body'], parse_dates=['time'])
-        print(f"✓ Model CSV loaded from s3://{bucket_name}/{s3_key}")
+        print(f"Model CSV loaded from s3://{bucket_name}/{s3_key}")
         return df
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
             # File doesn't exist yet, which is normal
             return None
         else:
-            print(f"✗ Error reading model CSV from S3: {e}")
+            print(f"Error reading model CSV from S3: {e}")
             return None
     except Exception as e:
-        print(f"✗ Error reading model CSV from S3: {e}")
+        print(f"Error reading model CSV from S3: {e}")
         return None
 
 
@@ -1109,3 +1160,66 @@ def check_model_csv_exists_s3(s3_client, bucket_name, s3_prefix, location_name):
             return False
     except Exception:
         return False
+    
+    
+def upload_model_to_s3(model, loc, spec, s3_client=None):
+    """Uploads a trained model to S3 and verifies upload."""
+    if s3_client is None:
+        print("No s3_client provided, skipping model upload.")
+        return
+    model_path = f"lgbm_{loc}_{spec}.joblib"
+    joblib.dump(model, model_path)
+    s3_bucket = "smce-geos-cf-forecasts-oss-shared"
+    s3_key = f"snwg_forecast_working_files/MODELS/{model_path}"
+    try:
+        s3_client.upload_file(model_path, s3_bucket, s3_key)
+        print(f"Model uploaded to s3://{s3_bucket}/{s3_key}")
+        # Verify upload
+        response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)
+        found = any(obj['Key'] == s3_key for obj in response.get('Contents', []))
+        if found:
+            print("S3 upload verified.")
+        else:
+            print("Warning: Model upload to S3 could not be verified.")
+    except Exception as s3e:
+        print(f"[ERROR] Model upload to S3 failed: {s3e}")
+    finally:
+        if os.path.exists(model_path):
+            os.remove(model_path)
+            
+def gen_plot(df, clmn_grps, clrs, stls, ttl, ylbls, sv_pth=None, lbl_rnm=None, resample='1D'):
+    # Resample time series if requested
+    if resample:
+        df = df.copy()
+        df['time'] = pd.to_datetime(df['time'])
+        df = df.set_index('time')
+        # Only resample numeric columns
+        for col in set(sum(clmn_grps, [])):
+            if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].resample(resample).mean()
+        df = df.reset_index()
+        print('Resampled DataFrame head:')
+        print(df.head())
+    nm_plt = len(clmn_grps)
+    fig, axs = plt.subplots(nm_plt, 1, figsize=(12, 4*nm_plt), sharex=True)
+    if nm_plt == 1:
+        axs = [axs]
+    for i, (clmns, ax) in enumerate(zip(clmn_grps, axs)):
+        for cl, clr, stl in zip(clmns, clrs[i], stls[i]):
+            lbl = lbl_rnm.get(cl, cl) if lbl_rnm else cl
+            if cl in df.columns:
+                # Only plot non-NaN segments
+                x_data = df["time"]
+                y_data = df[cl]
+                mask = ~y_data.isnull()
+                if mask.any():
+                    ax.plot(x_data[mask], y_data[mask], color=clr, linestyle=stl, linewidth=2.0, label=lbl)
+        ax.set_title(f"{ttl} - {', '.join(clmns)}", fontsize=14)
+        ax.set_ylabel(ylbls[i], fontsize=12)
+        ax.legend(fontsize=10)
+        ax.grid(False)
+    plt.tight_layout()
+    if sv_pth:
+        plt.savefig(sv_pth, dpi=300) 
+        print(f"Plot saved at: {sv_pth}")
+    plt.show()

@@ -54,6 +54,7 @@ from urllib.parse import urlencode
 import urllib.request
 import boto3
 from botocore.exceptions import ClientError
+import joblib 
 
 # IPython and display
 from IPython.display import HTML
@@ -1517,380 +1518,181 @@ class ObsSite:
         if OUTPUT == "dataframe":
             return to_plot
 
-def clean_data(X, Y):
-    valid_idx = ~(np.isnan(Y) | np.isinf(Y))  
-    return X[valid_idx], Y[valid_idx]
 
-def clean_feature_names(df):
-    df.columns = [re.sub(r'[^\w]', '_', str(col)) for col in df.columns] 
-    return df
+def get_localised_forecast(
+    loc='',
+    spec='no2',
+    lat=0.0,
+    lon=0.0,
+    mod_src='s3',
+    obs_src='pandora',
+    openaq_id=None,
+    GEOS_CF=None,
+    OBS_URL=None,
+    st=None,
+    ed=None,
+    resamp='1h',
+    unit='ppb',
+    interpol=True,
+    rmv_out=True,
+    time_col='time',
+    date_fmt='%Y-%m-%d %H:%M',
+    obs_val_col='unit',
+    lat_col=None,
+    lon_col=None,
+    silent=False,
+    force_retrain=True,
+    **kwargs
+):
+   
 
+    # Set defaults if not provided
+    if st is None:
+        st = dt.datetime(2018, 1, 1)
+    if ed is None:
+        ed = dt.datetime.today()
+    if GEOS_CF is None:
+        GEOS_CF = ''
+    if OBS_URL is None:
+        OBS_URL = ''
 
-def convert_times_column(df, time_column, lat, lon):
-    tf = TimezoneFinder()
-    tz_str = tf.timezone_at(lat=lat, lng=lon)
-    if tz_str is None:
-        tz_str = 'UTC'
-    tz = pytz.timezone(tz_str)
-
-    def to_local(t):
-        if t.tzinfo is None:
-            t = pytz.utc.localize(t)
-        else:
-            t = t.astimezone(pytz.utc)
-        return t.astimezone(tz)
-
-    df['local_time'] = df[time_column].apply(to_local)
-    df['timezone'] = tz_str
-    return df
-
-
-
-def get_localised_forecast(**kwargs):
-    """Routine to generate localised forecasts based on GEOS CF and local observation data.
-
-    Parameters
-    ----------
-    site_settings: dict
-        A dictionary containing site-specific settings.
-        l_name : str
-            Name of the location.
-        species : str
-            Type of species for which forecast is generated.
-        silent : bool
-            Flag to suppress notifications and warnings.
-        lat : float
-            Latitude of the location.
-        lon : float
-            Longitude of the location.
-        model_src : str
-            Source of the model for forecast generation.
-        obs_src : str
-            Source of the observation data.
-        openaq_id : str
-            ID associated with the OpenAQ data.
-        model_url : str
-            URL for accessing the GEOS CF model.
-        obs_url : str
-            URL for accessing the observation data.
-        start : str
-            Start date for the forecast.
-        end : str
-            End date for the forecast.
-        resample : str
-            Resampling frequency for the data.
-        model_tuning : str
-            Model tuning parameters.
-        unit : str
-            Unit of measurement for the forecast.
-        interpolation : str
-            Interpolation method for data processing.
-        remove_outlier : int
-            Threshold for removing outliers from observations.
-
-    obs_settings: dict
-        A dictionary containing observation-specific settings.
-        time_col : str
-            Column name for time in the observation data.
-        date_format : str
-            Format of the date in the observation data.
-        obs_val_col : str
-            Column name for observed values.
-        lat_col : str
-            Column name for latitude in the observation data.
-        lon_col : str
-            Column name for longitude in the observation data.
-    """
-    location_name = kwargs["site_settings"]["l_name"]
-    species = kwargs["site_settings"]["species"]
-    silent = kwargs["site_settings"]["silent"]
-    lat = kwargs["site_settings"]["lat"]
-    lon = kwargs["site_settings"]["lon"]
-    model_source = kwargs["site_settings"]["model_src"]
-    observation_source = kwargs["site_settings"]["obs_src"]
-    openaq_id = kwargs["site_settings"]["openaq_id"]
-    GEOS_CF = kwargs["site_settings"]["model_url"]
-    OBS_URL = kwargs["site_settings"]["obs_url"]
-    start = kwargs["site_settings"]["start"]
-    end = kwargs["site_settings"]["end"]
-    resample = kwargs["site_settings"]["resample"]
-    model_tuning = kwargs["site_settings"]["model_tuning"]
-    unit = kwargs["site_settings"]["unit"]
-    interpolation = kwargs["site_settings"]["interpolation"]
-    remove_outlier = kwargs["site_settings"]["remove_outlier"]
-
-    time_col = kwargs["obs_settings"]["time_col"]
-    date_format = kwargs["obs_settings"]["date_format"]
-    obs_val_col = kwargs["obs_settings"]["obs_val_col"]
-    lat_col = kwargs["obs_settings"]["lat_col"]
-    lon_col = kwargs["obs_settings"]["lon_col"]
-    remove_outlier = kwargs["obs_settings"]["remove_outlier"]
-    ## Data preparation
-    all_obs = pd.DataFrame()
-    isite = ObsSite(
-        openaq_id,
-        model_source=model_source,
-        species=species,
-        observation_source=observation_source,
-    )
-    isite._silent = silent
-    isite.read_obs(
-        source=observation_source,
-        url=OBS_URL,
-        time_col=time_col,
-        date_format=date_format,
-        value_collum=obs_val_col,
-        lat_col=lat_col,
-        lon_col=lon_col,
-        species=species,
-        lat=lat,
-        lon=lon,
-        unit=unit,
-        remove_outlier = remove_outlier,
-        **kwargs,
-    )
-
-    all_obs = isite._obs
-    isite.read_mod(source=model_source, url=GEOS_CF)
-    all_data = isite._merge(interpolation=interpolation)
-    all_data.dropna()
+    # Data preparation
+    try:
+        obs_dt = pd.DataFrame()
+        site = mlpred.ObsSite(openaq_id, model_source=mod_src, species=spec, observation_source=obs_src)
+        site._silent = silent
+        site.read_obs(source=obs_src, url=OBS_URL, time_col=time_col, date_format=date_fmt, value_collum=obs_val_col, lat_col=lat_col, lon_col=lon_col, species=spec, lat=lat, lon=lon, unit=unit, remove_outlier=rmv_out, **kwargs)
+        obs_dt = site._obs
+        site.read_mod(source=mod_src, url=GEOS_CF)
+        merged = site._merge(interpolation=interpol)
+        loc_dt = merged.dropna(subset=["value"])
+        pred_dt = site._mod.copy()
+        pred_dt["time"] = pd.to_datetime(pred_dt["time"])
+    except Exception as e:
+        print(f"[ERROR] Data preparation failed: {e}")
+        return None, None, None
 
     yvar = "value"
-    fvar = "pm25_rh35_gcc" if isite._species == "pm25" else isite._species.lower()
-    
-    if model_source == "pandora":
-        fvar = "pandora"
-    
-    ## Unusual difference between OBS and Model
-    difference = all_data[fvar].mean() / all_data[yvar].mean()
-    log_if_condition(
-        (difference > 2),
-        f"UNIT ERROR: GEOS CF IS HIGHER BY: {difference} IN LOCATION: {location_name} SPECIES: {species.lower()}",
-    )
+    fvar = "pm25_rh35_gcc" if getattr(site, '_species', 'no2') == "pm25" else getattr(site, '_species', 'no2').lower()
+    if mod_src == "pandora": fvar = "pandora"
 
-    skipvar = [
-        "time",
-        "location",
-        "lat",
-        "lon",
-        "totcol_co",
-        "totcol_hcho",
-        "totcol_no2",
-        "totcol_o3",
-        "totcol_so2",
-        "tropcol_co",
-        "tropcol_hcho",
-        "tropcol_o3",
-        "tropcol_so2",
-    ]
+    try:
+        diff = loc_dt[fvar].mean() / loc_dt[yvar].mean()
+        funcs.log_if_condition((diff > 2), f"UNIT ERROR: GEOS CF IS HIGHER BY: {diff} IN LOCATION: {loc} SPECIES: {spec.lower()}")
+    except Exception:
+        pass
+
+    skipvar = ["time", "location", "lat", "lon", "totcol_co", "totcol_hcho", "totcol_no2", "totcol_o3", "totcol_so2", "tropcol_co", "tropcol_hcho", "tropcol_o3", "tropcol_so2"]
     blacklist = skipvar + [yvar]
 
-    if remove_outlier:
+    try:
+        if rmv_out:
+            conc_obs = loc_dt[yvar].values.reshape(-1, 1)
+            nan_mask = ~np.isnan(conc_obs).flatten()
+            conc_obs = conc_obs[nan_mask]
+            loc_dt = loc_dt[nan_mask]
+            if len(conc_obs) == 0: raise ValueError("No valid observations remaining after NaN removal")
+            model_IF = IForest(contamination=0.05)
+            model_IF.fit(conc_obs)
+            anomalies = model_IF.predict(conc_obs)
+            loc_dt = loc_dt[anomalies != 1]
+    except Exception as e:
+        print(f"[ERROR] Outlier removal failed: {e}")
+        return None, None, None
+
+    # Feature selection
+    try:
+        corrs = loc_dt.corr()[yvar].drop(yvar)
+        sel_feats = [col for col in corrs.index if abs(corrs[col]) > 0.1 and col not in blacklist]
+        x = loc_dt[sel_feats]
+        y = loc_dt[yvar]
+    except Exception as e:
+        print(f"[ERROR] Feature selection failed: {e}")
+        return None, None, None
+
+    # Split and clean
+    try:
+        tx, vx, ty, vy = train_test_split(x, y, test_size=0.3, random_state=7)
+        tx, ty = funcs.clean_data(tx, ty)
+        vx, vy = funcs.clean_data(vx, vy)
+        tx = funcs.clean_feature_names(tx)
+        vx = funcs.clean_feature_names(vx)
+    except Exception as e:
+        print(f"[ERROR] Data split/clean failed: {e}")
+        return None, None, None
+
+    model_path = f"MODELS/lgbm_{loc}_{spec}.joblib"
+    use_pretrained = os.path.exists(model_path) and not force_retrain
+    if use_pretrained:
         if not silent:
-            print("outlier to be removed is selected")
-        concentration_obs = all_data[yvar].values.reshape(-1, 1)
-
-        nan_mask = ~np.isnan(concentration_obs).flatten()
-        concentration_obs = concentration_obs[nan_mask]
-        all_data = all_data[nan_mask]
-
-        if len(concentration_obs) == 0:
-            raise ValueError("No valid observations remaining after NaN removal")
-
-        model_IF = IForest(contamination=0.05)
-        model_IF.fit(concentration_obs)
-        anomalies = model_IF.predict(concentration_obs)
-        all_data = all_data[anomalies != 1]
-
-
-    xvar = [i for i in all_data.columns if i not in blacklist]
-
-    x = all_data[xvar]
-    y = all_data[yvar]
-
-
-   
-    scaler = MinMaxScaler()
-    x_scaled = scaler.fit_transform(all_data[xvar].values.reshape(-1, 1))
-    y_scaled = scaler.fit_transform(all_data[yvar].values.reshape(-1, 1))
-
-    X_train, X_test, Y_train, Y_test = train_test_split(x, y, test_size=0.3, random_state=7)
-    
-    print(X_train.columns)
-
-    # Clean training and test data
-    X_train, Y_train = clean_data(X_train, Y_train)
-    X_test, Y_test = clean_data(X_test, Y_test)
-    
-    X_train = clean_feature_names(X_train)
-    X_test = clean_feature_names(X_test)
-    
-   
-    # Baseline model using XGBoost
-    baseline_model_xgb = xgb.XGBRegressor(eval_metric="rmse", verbose=0)  # Use verbose=0 to suppress output
-    baseline_model_xgb.fit(X_train, Y_train)
-    baseline_model_score_xgb = baseline_model_xgb.score(X_test, Y_test)
-
-    # Baseline model using LightGBM
-    X_train = clean_feature_names(X_train)
-    X_test = clean_feature_names(X_test)
-
-    # Now, LightGBM should train without issues
-    baseline_model_lgb = lgb.LGBMRegressor(verbosity=-1) 
-    baseline_model_lgb.fit(X_train, Y_train)
-
-    
-    baseline_model_score_lgb = baseline_model_lgb.score(X_test, Y_test)
-
-
-    if baseline_model_score_xgb > baseline_model_score_lgb:
-        baseline_model = baseline_model_xgb
-        print("XGBoost is the baseline model.")
+            print(f"Loading pretrained model from {model_path}")
+        model_lgb = joblib.load(model_path)
     else:
-        baseline_model = baseline_model_lgb
-        print("LightGBM is the baseline model.")
-
-    eval_set = [(X_train, Y_train), (X_test, Y_test)]
-
-    if model_tuning:
-        # Tuning parameters for XGBoost
-        param_grid_xgb = {
-            "learning_rate": [0.01, 0.1, 0.3],
-            "max_depth": [3, 10, 15],
-            "n_estimators": [50, 500, 1000],
+        rs_params = {
+            'num_leaves': [15, 31, 63],
+            'max_depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.05, 0.1],
+            'n_estimators': [100, 300, 500],
+            'reg_alpha': [0, 0.1, 0.5],
+            'reg_lambda': [0, 0.1, 0.5]
         }
-        grid_search_xgb = GridSearchCV(estimator=baseline_model_xgb,
-                                       param_grid=param_grid_xgb,
-                                       cv=5,
-                                       scoring="neg_mean_squared_error")
-        grid_search_xgb.fit(X_train, Y_train)
+        try:
+            rs = RandomizedSearchCV(lgb.LGBMRegressor(verbosity=-1), rs_params, n_iter=10, cv=3, scoring='neg_mean_squared_error', n_jobs=-1, error_score='raise', random_state=42)
+            rs.fit(tx, ty)
+            if not silent:
+                print(f"Best params: {rs.best_params_}")
+            from lightgbm import early_stopping
+            model_lgb = lgb.LGBMRegressor(**rs.best_params_, verbosity=-1)
+            model_lgb.fit(tx, ty, eval_set=[(vx, vy)], callbacks=[early_stopping(stopping_rounds=20, verbose=0)])
+            joblib.dump(model_lgb, model_path)
+            if not silent:
+                print(f"Model trained and saved to {model_path}")
+        except Exception as e:
+            print(f"[ERROR] Model tuning/training failed: {e}")
+            return None, None, None
 
-        # Tuning parameters for LightGBM
-        param_grid_lgb = {
-            "learning_rate": [0.01, 0.1, 0.3],
-            "max_depth": [3, 10, 15],
-            "n_estimators": [50, 500, 1000],
-            
-        }
-        
-        grid_search_lgb = GridSearchCV(estimator=baseline_model_lgb,
-                                   param_grid=param_grid_lgb,
-                                   cv=5,
-                                   scoring="neg_mean_squared_error",
-                                   verbose=0) 
-        grid_search_lgb.fit(X_train, Y_train)
+    try:
+        vy_pred = model_lgb.predict(vx)
+        rmse = round(root_mean_squared_error(vy, vy_pred), 2)
+        r2 = round(r2_score(vy, vy_pred), 2)
+        mae = round(mean_absolute_error(vy, vy_pred), 2)
+        metrics = {'RMSE': rmse, 'R2': r2, 'MAE': mae}
+        if not silent:
+            print(f"Model performance: RMSE={rmse}, R2={r2}, MAE={mae}")
+            print(f"Selected features: {sel_feats}")
+        funcs.log_if_condition((r2 < 0.5), f"MODEL ERROR: MODEL RUNS POORLY IN THIS LOCATION: R2: {r2} ; RMSE: {rmse} IN LOCATION: {loc} SPECIES: {spec.lower()}")
+    except Exception as e:
+        print(f"[ERROR] Metrics calculation failed: {e}")
+        metrics = None
 
-        if grid_search_xgb.best_score_ > grid_search_lgb.best_score_:
-            best_params = grid_search_xgb.best_params_
-            best_model = xgb.XGBRegressor(**best_params)
-            print("XGBoost is the best performer after tuning.")
-        else:
-            best_params = grid_search_lgb.best_params_
-            best_model = lgb.LGBMRegressor(**best_params)
-            print("LightGBM is the best performer after tuning.")
+    try:
+        pred_dt["time"] = [dt.datetime(i.year, i.month, i.day, i.hour, 0, 0) for i in pred_dt["time"]]
+        pred_mask = pred_dt[sel_feats].notnull().all(axis=1)
+        pred_dt["localised"] = np.nan
+        pred_dt.loc[pred_mask, "localised"] = model_lgb.predict(pred_dt.loc[pred_mask, sel_feats])
+    except Exception as e:
+        print(f"[ERROR] Prediction failed: {e}")
+        return None, metrics, model_lgb
 
-        best_model.fit(X_train, Y_train)
-        selected_model = best_model
-    
-    else:
-        selected_model = baseline_model
+    obs = site._obs[["time", "value"]].copy()
+    obs["time"] = [dt.datetime(i.year, i.month, i.day, i.hour, 0, 0) for i in obs["time"]]
 
-    selected_model.fit(
-        X_train,
-        Y_train,
-        eval_set=eval_set
-    )
-    Y_pred = selected_model.predict(X_test)
-    rmse = round(root_mean_squared_error(Y_test, Y_pred), 2)
-    r2 = round(r2_score(Y_test, Y_pred), 2)
-    mae = round(mean_absolute_error(Y_test, Y_pred), 2)
-    
-    metrics = np.array([
-    rmse,r2, mae
-    ])
+    def clean_merged_values(df):
+        if {'value_x', 'value_y'}.issubset(df.columns):
+            df['value'] = df['value_x'].combine_first(df['value_y'])
+            return df.drop(['value_x', 'value_y'], axis=1)
+        return df
 
-    log_if_condition(
-        (r2 < 0.5),
-        f"MODEL ERROR: MODEL RUNS POORLY IN THIS LOCATION: R2: {r2} ; RMSE: {rmse} IN LOCATION: {location_name} SPECIES: {species.lower()}",
-    )
-
-    ## Preparing the final dataframe with forecasts
-    start = start if start is not None else all_obs["time"].min()
-    end = end if end is not None else all_obs["time"].min()
-    if not isite._silent:
-        print(f"predictions started: {start}")
-    model_data = isite._read_model(
-        ilon=isite._lon,
-        ilat=isite._lat,
-        start=start,
-        end=dt.datetime.today() + dt.timedelta(days=7),
-        source=model_source,
-        url=GEOS_CF,
-        model_cache_source=kwargs.get('model_cache_source', 'local'),
-        s3_client=kwargs.get('s3_client', None),
-        s3_bucket=kwargs.get('s3_bucket', None),
-        s3_prefix=kwargs.get('s3_prefix', 'snwg_forecast_working_files/GEOS_CF/'),
-    )
-    model_data["time"] = [
-        dt.datetime(i.year, i.month, i.day, i.hour, 0, 0) for i in model_data["time"]
-    ]
-    model_data["localised"] = selected_model.predict(model_data[X_test.columns])
-    observation = isite._obs[["time", "value"]].copy()
-    observation["time"] = [
-        dt.datetime(i.year, i.month, i.day, i.hour, 0, 0) for i in observation["time"]
-    ]
-    
-    merged_data = None
-    all_validation_data = pd.DataFrame()
-
-    if 'validation_sets' in kwargs:
-        
-        validation_sets = kwargs["validation_sets"]
-
-        all_validation_data_list = []
-        for dataset in validation_sets:
-            all_obs = read_validation_set(**dataset)
-            if all_obs is not None:
-                if "value" in all_obs.columns:
-                    all_obs.rename(columns={"value": dataset["name"]}, inplace=True)
-                all_obs = all_obs[["time", dataset["name"]]]
-                all_validation_data_list.append(all_obs)
-
-        if all_validation_data_list:
-            if len(all_validation_data_list) == 1:
-                all_validation_data = all_validation_data_list[0]
-            else:
-                all_validation_data = pd.merge(all_validation_data_list[0], all_validation_data_list[1], on='time', how='outer')
-                for i in range(2, len(all_validation_data_list)):
-                    all_validation_data = pd.merge(all_validation_data, all_validation_data_list[i], on='time', how='outer')
-
-            print(all_validation_data.columns)
-        else:
-            print("No validation data available.")
-    else:
-        print("No validation sets found.")
-
-    
-    if  all_validation_data.empty:
-        merged_data = merge_dataframes(
-            [model_data, observation], index_col="time", resample=resample, how ="outer")
-        print("Validation set is empty")
-    else:
-        merged_data = merge_dataframes(
-            [model_data, observation, all_validation_data],
-            index_col="time",
-            resample=resample, how ="outer")
-    
-    #merged_data = merged_data.dropna(subset=['value'])
-
-   # HAQAST_data_product = merge_dataframes([model_data, observation], index_col="time", resample="1h")
-    
-    #export_to_gesdisc(HAQAST_DATA=HAQAST_data_product,location_name=location_name,species=species, unit=unit, lat=isite._lat, lon=isite._lon)
-    #location_plot( dataframe=merged_data, location_name=location_name, title=f"{location_name} ( {species} ) ({isite._lat}, {isite._lon} | {resample} resample)", species=species, unit=unit, model_info=f"(r2:{r2} | rmse:{rmse})", resample = resample )
-    if isite._silent:
-        print(f"forecasts generated for {fvar}")
-    #merged_data.to_csv(f"location_data/{location_name}_{species}_{resample}_resample.csv")
-    return merged_data, metrics
+    merge_list = [pred_dt, obs]
+    try:
+        merged_data = funcs.merge_dataframes(merge_list, index_col="time", resample=resamp, how="outer")
+        merged_data = clean_merged_values(merged_data)
+        if not silent:
+            print("merged_data time range:", merged_data["time"].min(), merged_data["time"].max())
+    except Exception as e:
+        print(f"[ERROR] Merging failed: {e}")
+        merged_data = None
+    return merged_data, metrics, model_lgb
 
 
 ## General Functions
@@ -2307,7 +2109,7 @@ def read_merra2_cnn(base_url=MERRA2CNN, site=None, frequency=30, lat=None, lon=N
     )
 
     # Merge and process data
-    merg = mlpred.merge_dataframes([all_data, geos_cf], "time", resample="3h", how="outer")
+    merg = mlpred.funcs.merge_dataframes([all_data, geos_cf], "time", resample="3h", how="outer")
 
     species_map = {'PM2.5': 'pm25_rh35_gcc', 'NO2': 'no2', 'O3': 'o3'}
     avg_hours = {'NO2': 3, 'O3': 1}
@@ -2553,36 +2355,6 @@ def location_plot(dataframe=None, location_name=None, title="Location x (lat, lo
 
     return fig
 
-
-def gen_plot(df, clmn_grps, clrs, stls, ttl, ylbls, sv_pth=None, lbl_rnm=None, resample='1D'):
-    nm_plt = len(clmn_grps)
-    fig, axs = plt.subplots(nm_plt, 1, figsize=(12, 4*nm_plt), sharex=True)
-    
-    if nm_plt == 1:
-        axs = [axs]
-    
-    for i, (clmns, ax) in enumerate(zip(clmn_grps, axs)):
-        for cl, clr, stl in zip(clmns, clrs[i], stls[i]):
-            lbl = lbl_rnm.get(cl, cl) if lbl_rnm else cl
-            
-            x_data = df["time"]
-            y_data = df[cl]
-            
-            ax.plot(x_data, y_data, color=clr, linestyle=stl, linewidth=2.0, label=lbl)
-        
-        ax.set_title(f"{ttl} - {', '.join(clmns)}", fontsize=14)
-        ax.set_ylabel(ylbls[i], fontsize=12)
-        ax.legend(fontsize=10)
-        ax.grid(False)
-    
-    plt.tight_layout()
-    
-    if sv_pth:
-        plt.savefig(sv_pth, dpi=300) 
-        print(f"Plot saved at: {sv_pth}")
-    plt.show()
-    
-
 def resample_selected_columns(df, timecol, clmn_grps, resample_freq='1D'):
 
     df[timecol] = pd.to_datetime(df[timecol])
@@ -2602,15 +2374,6 @@ def resample_selected_columns(df, timecol, clmn_grps, resample_freq='1D'):
     
     return df_resampled
 
-def merge_dataframes(df_list, index_col, resample=None, how= 'outer'):
-    """merge data routine"""
-    merged_df = df_list[0]
-    for df in df_list[1:]:
-        merged_df = pd.merge(merged_df, df, on=index_col, how=how)
-    if resample:
-        numeric_cols = merged_df.select_dtypes(include='number').columns.tolist()
-        merged_df = merged_df.resample(resample, on=index_col)[numeric_cols].mean().reset_index()
-    return merged_df
 
 
 
@@ -2999,16 +2762,6 @@ def convert_ugm3_to_ppbv(value,species):
     return ppbv
 
 
-def log_if_condition(condition, message, log_file="logs/locations_log.txt"):
-    """Log management routine"""
-    try:
-        if condition:
-            current_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            os.makedirs(os.path.dirname(log_file), exist_ok=True)
-            with open(log_file, "a") as log:
-                log.write(f"{current_time} - {message}\n")
-    except Exception as e:
-        print(f"Error occurred while logging: {e}")
 
 def get_location_info(url, location_code):
     print(url)
@@ -3303,7 +3056,7 @@ def process_location_data(code=None):
 
     if not openaq_obs.empty:
         openaq_obs.rename(columns={'value': 'openaq'}, inplace=True)
-        preddf = merge_dataframes(
+        preddf = funcs.merge_dataframes(
         [merged_data, openaq_obs[["time","openaq"]]], 
         index_col="time", 
         resample=f'{resample_size}', 
@@ -3827,11 +3580,11 @@ def read_geoscf(
                     s3_client.list_objects_v2(Bucket=s3_bucket_name, Prefix="snwg_forecast_working_files/GEOS_CF/", MaxKeys=1)
                     if os.path.exists(csv_path):
                         s3_client.upload_file(csv_path, s3_bucket_name, s3_key)
-                        print(f"✅ CSV uploaded to s3://{s3_bucket_name}/{s3_key}")
+                        print(f"CSV uploaded to s3://{s3_bucket_name}/{s3_key}")
                     else:
-                        print(f"❌ Local CSV {csv_path} does not exist, skipping S3 upload.")
+                        print(f"Local CSV {csv_path} does not exist, skipping S3 upload.")
                 except ClientError as e:
-                    print(f"❌ S3 access/upload failed: {e}")
+                    print(f"S3 access/upload failed: {e}")
                 # --- S3 UPLOAD LOGIC END ---
     
                 df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
