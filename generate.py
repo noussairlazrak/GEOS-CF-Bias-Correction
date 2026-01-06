@@ -49,9 +49,14 @@ s3_prefixes = [
     "snwg_forecast_working_files/plots/",
     "snwg_forecast_working_files/precomputed/all_dts/"
 ]
+s3_bucket_public = "smce-geos-cf-public"
+s3_prefixes_public = [
+    "snwg_forecast_working_files/precomputed/all_dts/"
+]
 
 # Check S3 connectivity for all required prefixes
 funcs.check_s3_connectivity(s3_bucket, s3_prefixes)
+funcs.check_s3_connectivity(s3_bucket_public, s3_prefixes_public)
 
 # Create local directories (skip if NO_LOCAL_SAVE)
 if not NO_LOCAL_SAVE:
@@ -104,7 +109,7 @@ for key, location_data in list(data.items()):
                 
                 if NO_LOCAL_SAVE:
                     # Save directly to S3 without local file
-                    s3_bucket_name = s3_bucket.replace("s3://", "")
+                    s3_bucket_name = s3_bucket_public.replace("s3://", "")
                     s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{site}.json"
                     if funcs.write_to_s3(merra2cnn, s3_client, s3_bucket_name, s3_key, data_format='json'):
                         print(f"NO2 forecast for {locname} uploaded to S3")
@@ -113,7 +118,7 @@ for key, location_data in list(data.items()):
                 else:
                     funcs.save_forecast_to_json(merra2cnn, metadata, site_settings=site_settings, species="pm25", sources=["merra2", "geoscf"], output_path=site_file_path)
                     # Upload to S3
-                    if funcs.upload_to_s3(site_file_path, s3_client, s3_bucket):
+                    if funcs.upload_to_s3(site_file_path, s3_client, s3_bucket_public):
                         print(f"NO2 forecast for {locname} uploaded to S3")
                     
                     # Clean up local file if requested
@@ -303,7 +308,7 @@ for key, location_data in list(data.items()):
 
                 if NO_LOCAL_SAVE:
                     # Save directly to S3
-                    s3_bucket_name = s3_bucket.replace("s3://", "")
+                    s3_bucket_name = s3_bucket_public.replace("s3://", "")
                     s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{locname}.json"
                     # Convert DataFrame
                     merg_dict = merg.to_dict(orient='records')
@@ -334,7 +339,7 @@ for key, location_data in list(data.items()):
                     except Exception as e:
                         print(f"Warning: Could not add metrics to local JSON for {locname}: {e}")
                     # Upload to S3
-                    if funcs.upload_to_s3(file_path, s3_client, s3_bucket):
+                    if funcs.upload_to_s3(file_path, s3_client, s3_bucket_public):
                         print(f"no2 forecast for {locname} uploaded to S3")
                     if CLEAN_LOCAL:
                         try:
