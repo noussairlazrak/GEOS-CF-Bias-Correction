@@ -1,14 +1,24 @@
 import os
 import json
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 import gzip
 from timezonefinder import TimezoneFinder
 import pytz
+
+
+from tiffs import (
+    latest_init_date_and_hour,
+    DEFAULT_VARIABLES,
+    run as generate_tiffs,
+)
 
 input_dirs = {
     'precomputed/all_dts'
 }
 output_file = 'precomputed/combined_forecasts.json.gz'
+tiff_output_dir = Path('precomputed/pmtiles_output')
 
 now = datetime.now()
 cutoff = now + timedelta(hours=48)
@@ -96,7 +106,31 @@ def process_directory(input_dir):
 for dir_path in input_dirs:
     process_directory(dir_path)
 
+print(f"Processed {len(combined_data)} forecast locations")
+
+
 with gzip.open(output_file, 'wt', encoding='utf-8') as out_file:
     json.dump(combined_data, out_file, indent=2)
 
 print(f"Saved combined forecasts to {output_file}")
+
+
+print("\n=== Generating GeoTIFF files from GEOS-CF ===")
+try:
+    init_date, init_hour = latest_init_date_and_hour()
+    print(f"Detected latest GEOS-CF run: {init_date} {init_hour}z")
+    
+    generate_tiffs(
+        init_date=init_date,
+        init_hour=init_hour,
+        variables=DEFAULT_VARIABLES,
+        output_dir=tiff_output_dir,
+        keep_nc4=False,
+        days=5,
+        tmp_dir_override=None,
+    )
+    print("GeoTIFF generation completed successfully!")
+except Exception as e:
+    print(f"Warning: Could not generate GeoTIFFs: {e}", file=sys.stderr)
+    print("Forecasts were still saved to compressed JSON file")
+

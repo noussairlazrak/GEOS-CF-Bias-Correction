@@ -1,21 +1,39 @@
-import json
-import math
+# Standard library imports
 import os
+import sys
+import json
 import re
-import io
+import math
+import datetime as dt
 from datetime import datetime, timedelta
-from timezonefinder import TimezoneFinder
-import pytz
-import boto3
+
+# Third-party library imports
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from sklearn.base import BaseEstimator
+from sklearn.model_selection import train_test_split, KFold, TimeSeriesSplit
+from sklearn.metrics import (
+    mean_squared_error,
+    r2_score,
+    accuracy_score,
+    mean_absolute_error,
+    median_absolute_error
+)
+from sklearn.ensemble import GradientBoostingRegressor
 import requests
+import boto3
 from botocore.exceptions import ClientError
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import datetime as dt
+import joblib
+from timezonefinder import TimezoneFinder
+import pytz
+import io
+import fsspec
+import xarray as xr
 from MLpred import mlpred
-
 
 BREAKPOINTS = {
     'PM2.5': [
@@ -595,11 +613,7 @@ def save_forecast_to_json(merged_data=None, metrics=None, site_settings=None, sp
         end_date = "N/A"
 
     key_map = {
-        "NO2_AQI": "no2_aqi",
-        "O3_AQI": "o3_aqi",
-        "avg": "openaq",
-        "pm25_rh35_gcc": "pm25",
-        "PM25_NowCast_AQI": "pm25_aqi"
+
     }
 
     def safe_format_time(val):
@@ -1086,10 +1100,10 @@ def save_model_csv_to_s3(df, s3_client, bucket_name, s3_prefix, location_name):
             Key=s3_key,
             Body=csv_buffer.getvalue()
         )
-        print(f"Model CSV saved to s3://{bucket_name}/{s3_key}")
+        print(f"✓ Model CSV saved to s3://{bucket_name}/{s3_key}")
         return True
     except Exception as e:
-        print(f"Failed to save model CSV to S3: {e}")
+        print(f"✗ Failed to save model CSV to S3: {e}")
         return False
 
 
@@ -1116,17 +1130,17 @@ def read_model_csv_from_s3(s3_client, bucket_name, s3_prefix, location_name):
         s3_key = f"{s3_prefix}{location_name}.csv"
         response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
         df = pd.read_csv(response['Body'], parse_dates=['time'])
-        print(f"Model CSV loaded from s3://{bucket_name}/{s3_key}")
+        print(f"✓ Model CSV loaded from s3://{bucket_name}/{s3_key}")
         return df
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
             # File doesn't exist yet, which is normal
             return None
         else:
-            print(f"Error reading model CSV from S3: {e}")
+            print(f"✗ Error reading model CSV from S3: {e}")
             return None
     except Exception as e:
-        print(f"Error reading model CSV from S3: {e}")
+        print(f"✗ Error reading model CSV from S3: {e}")
         return None
 
 
@@ -1187,39 +1201,71 @@ def upload_model_to_s3(model, loc, spec, s3_client=None):
         if os.path.exists(model_path):
             os.remove(model_path)
             
-def gen_plot(df, clmn_grps, clrs, stls, ttl, ylbls, sv_pth=None, lbl_rnm=None, resample='1D'):
-    # Resample time series if requested
+def gen_plot(
+    df,
+    clmn_grps,
+    clrs,
+    stls,
+    ttl,
+    ylbls,
+    sv_pth=None,
+    lbl_rnm=None,
+    line_names=None,
+    resample='1D'
+):
+    # --- Resample time series if requested ---
     if resample:
         df = df.copy()
         df['time'] = pd.to_datetime(df['time'])
         df = df.set_index('time')
-        # Only resample numeric columns
+
         for col in set(sum(clmn_grps, [])):
             if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
                 df[col] = df[col].resample(resample).mean()
+
         df = df.reset_index()
-        print('Resampled DataFrame head:')
-        print(df.head())
+
     nm_plt = len(clmn_grps)
-    fig, axs = plt.subplots(nm_plt, 1, figsize=(12, 4*nm_plt), sharex=True)
+    fig, axs = plt.subplots(nm_plt, 1, figsize=(12, 4 * nm_plt), sharex=True)
+
     if nm_plt == 1:
         axs = [axs]
+
     for i, (clmns, ax) in enumerate(zip(clmn_grps, axs)):
-        for cl, clr, stl in zip(clmns, clrs[i], stls[i]):
-            lbl = lbl_rnm.get(cl, cl) if lbl_rnm else cl
+        for j, (cl, clr, stl) in enumerate(zip(clmns, clrs[i], stls[i])):
+
+            # --- Resolve line label ---
+            if line_names is not None:
+                lbl = line_names[i][j]
+            elif lbl_rnm is not None:
+                lbl = lbl_rnm.get(cl, cl)
+            else:
+                lbl = cl
+
             if cl in df.columns:
-                # Only plot non-NaN segments
                 x_data = df["time"]
                 y_data = df[cl]
                 mask = ~y_data.isnull()
+
                 if mask.any():
-                    ax.plot(x_data[mask], y_data[mask], color=clr, linestyle=stl, linewidth=2.0, label=lbl)
-        ax.set_title(f"{ttl} - {', '.join(clmns)}", fontsize=14)
+                    ax.plot(
+                        x_data[mask],
+                        y_data[mask],
+                        color=clr,
+                        linestyle=stl,
+                        linewidth=2.0,
+                        label=lbl
+                    )
+
+        ax.set_title(f"{ttl}", fontsize=14)
         ax.set_ylabel(ylbls[i], fontsize=12)
         ax.legend(fontsize=10)
         ax.grid(False)
+
     plt.tight_layout()
+
     if sv_pth:
-        plt.savefig(sv_pth, dpi=300) 
+        plt.savefig(sv_pth, dpi=300)
         print(f"Plot saved at: {sv_pth}")
+
     plt.show()
