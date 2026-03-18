@@ -13,6 +13,7 @@ import json
 import boto3
 import traceback
 import argparse
+import joblib 
 
 # command-line arguments
 parser = argparse.ArgumentParser(description='Generate and upload forecasts to S3')
@@ -80,7 +81,7 @@ all_locations = []
 force_update = True 
 #generting the forecasts routine
 for key, location_data in list(data.items()):
-    if location_data.get("observation_source") in ("#DoS_Missions", "NASA Pandora", "#REMMAQ"):
+    if location_data.get("observation_source") in ("DoS_Missions", "#NASA Pandora", "REMMAQ"):
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
         lat = location_data["lat"]
@@ -104,7 +105,7 @@ for key, location_data in list(data.items()):
             }
 
             try:
-                merra2cnn = mlpred.read_merra2_cnn(site=site, frequency = 10, lat = lat, lon = lon)
+                merra2cnn = mlpred.read_geos_fp_cnn(site=site, frequency = 5, lat = lat, lon = lon , silent=False, skip_geosfp = True)
                 metadata = None
                 
                 if NO_LOCAL_SAVE:
@@ -112,9 +113,9 @@ for key, location_data in list(data.items()):
                     s3_bucket_name = s3_bucket_public.replace("s3://", "")
                     s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{site}.json"
                     if funcs.write_to_s3(merra2cnn, s3_client, s3_bucket_name, s3_key, data_format='json'):
-                        print(f"NO2 forecast for {locname} uploaded to S3")
+                        print(f"PM2.5 forecast for {locname} uploaded to S3")
                     else:
-                        print(f"Warning: Failed to upload NO2 forecast for {locname} to S3")
+                        print(f"Warning: Failed to upload PM2.5 forecast for {locname} to S3")
                 else:
                     funcs.save_forecast_to_json(merra2cnn, metadata, site_settings=site_settings, species="pm25", sources=["merra2", "geoscf"], output_path=site_file_path)
                     # Upload to S3
@@ -222,7 +223,7 @@ for key, location_data in list(data.items()):
                 forecasts_raw = merged_data
                 metadata = metrics
                 col_map = {"time": "time", "no2": "no2", "localised": "corrected", "value": col_name}
-                fcast = forecasts_raw[[c for c in ["time", "no2", "localised", "value", "o3", "pm25_rh35_gcc", "rh","t10m","tprec","hcho"] if c in forecasts_raw.columns]].rename(columns=col_map)
+                fcast = forecasts_raw[[c for c in ["time", "no2", "localised", "value", "o3", "pm25_rh35", "rh","t","tprec","hcho"] if c in forecasts_raw.columns]].rename(columns=col_map)
                 fcast.iloc[:, 1:] = fcast.iloc[:, 1:].clip(lower=0)
 
                 start, end = fcast["time"].min(), fcast["time"].max()
@@ -300,7 +301,7 @@ for key, location_data in list(data.items()):
                 merg = merg[merg["time"] >= cutoff]
                 merg = funcs.convert_times_column(merg, 'time', lat, lon)
                 
-                species_map = { 'PM2.5': 'pm25_rh35_gcc', 'NO2': 'corrected', 'O3': 'o3' } 
+                species_map = { 'PM2.5': 'pm25_rh35', 'NO2': 'corrected', 'O3': 'o3' } 
                 avg_hours = { 'NO2': 3, 'O3': 1 }
 
                 merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)

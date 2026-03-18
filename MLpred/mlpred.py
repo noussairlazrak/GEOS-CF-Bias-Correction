@@ -71,16 +71,21 @@ ZARR_TEMPLATE = [
     "geos-cf/zarr/geos-cf.chm_tavg_1hr_g1440x721_v1.zarr",
 ]
 ZARR_TEMPLATE = ["geos-cf/zarr/geos-cf-rpl.zarr"]
-S3_TEMPLATE = "s3://smce-geos-cf-forecasts-oss-shared/geos-cf-rpl.zarr/"
-S3_FORECASTS_TEMPLATE = "s3://smce-geos-cf-forecasts-oss-shared/geos-cf-fcst-latest.zarr"
-S3_REPLAY_TEMPLATE = "s3://smce-geos-cf-forecasts-oss-shared/geos-cf-ana-latest.zarr"
+S3_TEMPLATE = "s3://s3://smce-geos-cf-public/geos-cf-rpl.zarr/"
+S3_FORECASTS_TEMPLATE = "s3://s3://smce-geos-cf-public/geos-cf-fcst-latest.zarr/"
+S3_REPLAY_TEMPLATE = "s3://s3://smce-geos-cf-public/geos-cf-ana-latest.zarr"
 OPENDAP_TEMPLATE = "https://opendap.nccs.nasa.gov/dods/gmao/geos-cf/fcast/met_tavg_1hr_g1440x721_x1.latest"
 M2_TEMPLATE = "/home/ftei-dsw/Projects/SurfNO2/data/M2/{c}/small/*.{c}.%Y%m*.nc4"
 M2_COLLECTIONS = ["tavg1_2d_flx_Nx", "tavg1_2d_lfo_Nx", "tavg1_2d_slv_Nx"]
 OPENAQ_TEMPLATE = "https://api.openaq.org/v2//measurements?date_from={Y1}-{M1}-01T00%3A00%3A00%2B00%3A00&date_to={Y2}-{M2}-01T00%3A00%3A00%2B00%3A00&limit=10000&page=1&offset=0&sort=asc&radius=1000&location_id={ID}&parameter={PARA}&order_by=datetime"
 
+S3_V2_RPL = "s3://s3://smce-geos-cf-public/geos-cf-v2-rpl.zarr"
+S3_V2_COLS = "s3://s3://smce-geos-cf-public/geos-cf-v2-rpl-cols.zarr"
+S3_V2_FCST = "s3://s3://smce-geos-cf-public/geos-cf-v2-fcst-latest.zarr/"
+
+
 OPENAQAPI = "ae1be41f0d6e6400a0ad67ccdb6bea912c7787a14038038d94dfc1b2044f7cd4"
-# OPENAQAPI = os.environ.get("OPENAQ_API_KEY")
+CACHE_DIR = "GEOS_CF"
 MERRA2CNN = "https://aeronet.gsfc.nasa.gov/cgi-bin/web_print_air_quality_index"
 
 DEFAULT_GASES = ["co", "hcho", "no", "no2", "noy", "o3"]
@@ -1022,9 +1027,9 @@ class ObsSite:
                 csv_path = None  
 
 
-            force_full_download = False
+            force_full_download = True
 
-            # Try to load existing cache
+            # load existing cache
             if model_cache_source == 'local':
                 df_existing = None
                 if os.path.exists(csv_path):
@@ -1062,6 +1067,7 @@ class ObsSite:
 
                     df_combined = pd.concat(df_all, ignore_index=True)
                     df_combined = df_combined.drop_duplicates(subset="time").sort_values("time")
+                    print(f'df_combined: {df_combined["time"].max()}')
 
                     # Save to cache (local or S3)
                     if model_cache_source == 'local':
@@ -1071,7 +1077,7 @@ class ObsSite:
                         funcs.save_model_csv_to_s3(df_combined, s3_client, s3_bucket, s3_prefix, location_name)
 
                     df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
-                    dfs.append(df_filtered)
+                    dfs.append(df_combined)
 
                 else:
                     print("CSV does not contain full history. Will fetch full data.")
@@ -1159,6 +1165,23 @@ class ObsSite:
                     print("Convert from v/v to ppbv: {}".format(g))
                 mod[g] = mod[g] * VVtoPPBV
 
+        """
+        mod['t10m'] = mod['t10m'].combine_first(mod['t'])
+        mod['u10m'] = mod['u10m'].combine_first(mod['u'])
+        mod['v10m'] = mod['v10m'].combine_first(mod['v'])
+        
+        mod['aod550_sala'] = mod['aod550_sna'].combine_first(mod['aod550_sna'])
+        mod['aod550_salc'] = mod['aod550_ss'].combine_first(mod['aod550_ss'])
+        mod = mod[['time', 'aod550_bc', 'aod550_dust', 'aod550_oc', 'aod550_sala',
+       'aod550_salc', 'cldtt', 'co', 'hcho', 'lat', 'lev',
+       'lon', 'no', 'no2', 'noy', 'o3', 'pm25_rh35_gcc', 'ps', 'rh', 't10m',
+       'tprec',
+       'tropcol_so2', 'u10m', 'v10m', 'zpbl']]
+        
+        print(mod.columns)
+        """
+        print(mod["time"].max())
+        
         return mod
 
 
@@ -1544,6 +1567,44 @@ def get_localised_forecast(
     force_retrain=True,
     **kwargs
 ):
+    """
+    Generate localized air quality forecasts using GEOS-CF model data and observations.
+    
+    Training Strategy:
+    ------------------
+    1. Train base model on GEOS-CF V1 historical data (2018 to recent)
+    2. Apply transfer learning using GEOS-CF V2 recent data (last 60 days)
+    3. Generate forecasts using GEOS-CF V2 forecast data only
+    
+    This approach leverages the longer historical record from V1 while adapting
+    to the improved V2 model for current and future predictions.
+    
+    Parameters
+    ----------
+    loc : str
+        Location name
+    spec : str
+        Species to forecast (e.g., 'no2', 'o3', 'pm25')
+    lat, lon : float
+        Location coordinates
+    mod_src : str
+        Model data source (default: 's3')
+    obs_src : str
+        Observation data source (default: 'pandora')
+    st, ed : datetime
+        Start and end dates for data
+    force_retrain : bool
+        If True, retrain model even if saved model exists
+    
+    Returns
+    -------
+    merged_data : pd.DataFrame
+        Combined observations, model data, and forecasts
+    metrics : dict
+        Model performance metrics (RMSE, R2, MAE)
+    model : LGBMRegressor
+        Trained model object
+    """
    
 
     # Set defaults if not provided
@@ -1561,15 +1622,58 @@ def get_localised_forecast(
         obs_dt = pd.DataFrame()
         site = mlpred.ObsSite(openaq_id, model_source=mod_src, species=spec, observation_source=obs_src)
         site._silent = silent
-        site.read_obs(source=obs_src, url=OBS_URL, time_col=time_col, date_format=date_fmt, value_collum=obs_val_col, lat_col=lat_col, lon_col=lon_col, species=spec, lat=lat, lon=lon, unit=unit, remove_outlier=rmv_out, **kwargs)
+        
+        # Read observations
+        site.read_obs(source=obs_src, url=OBS_URL, time_col=time_col, date_format=date_fmt, 
+                      value_collum=obs_val_col, lat_col=lat_col, lon_col=lon_col, species=spec, 
+                      lat=lat, lon=lon, unit=unit, remove_outlier=rmv_out, **kwargs)
         obs_dt = site._obs
-        site.read_mod(source=mod_src, url=GEOS_CF)
+        
+        if not silent:
+            print(f"Reading GEOS-CF data (V1 historical + V2 recent/forecast)...")
+        
+        # Define transition point between V1 and V2
+        v1_end = datetime.now() - timedelta(days=60)  # V1 ends 60 days ago
+        v2_start = v1_end  # V2 starts where V1 ends (no gap, no overlap)
+        
+        # Fetch V1 historical data (start to 60 days ago)
+        if not silent:
+            print(f"Fetching V1 data: {st.strftime('%Y-%m-%d')} to {v1_end.strftime('%Y-%m-%d')}")
+        df_v1 = mlpred.read_geos_cf(lon=lon, lat=lat, start=st, end=v1_end, version=1)
+        
+        # Fetch V2 recent + forecast data (60 days ago to future)
+        if not silent:
+            print(f"Fetching V2 data: {v2_start.strftime('%Y-%m-%d')} to present + 5 days forecast")
+        df_v2 = mlpred.read_geos_cf(lon=lon, lat=lat, start=v2_start, end=None, version=2)
+        
+        if not silent:
+            print(f"V1 data: {len(df_v1)} rows ({df_v1['time'].min()} to {df_v1['time'].max()})")
+            print(f"V2 data: {len(df_v2)} rows ({df_v2['time'].min()} to {df_v2['time'].max()})")
+        
+        # Combine into one consistent dataframe (V2 is continuation of V1)
+        site._mod = pd.concat([df_v1, df_v2], ignore_index=True).drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
+        
+        # Extract forecast portion (future dates only)
+        now = datetime.now()
+        pred_dt = site._mod[site._mod['time'] >= now - timedelta(hours=1)].copy()
+        
+        if not silent:
+            print(f"Combined continuous dataframe: {len(site._mod)} rows ({site._mod['time'].min()} to {site._mod['time'].max()})")
+            print(f"Forecast portion: {len(pred_dt)} rows (from {pred_dt['time'].min()} to {pred_dt['time'].max()})")
+            print(f"V2 forecast data: {len(pred_dt)} rows from {pred_dt['time'].min()} to {pred_dt['time'].max()}")
+        
+        # Merge observations with training data
         merged = site._merge(interpolation=interpol)
         loc_dt = merged.dropna(subset=["value"])
-        pred_dt = site._mod.copy()
+        
         pred_dt["time"] = pd.to_datetime(pred_dt["time"])
+        if not silent:
+            print(f'pred_dt max time: {pred_dt["time"].max()}')
+            
     except Exception as e:
-        print(f"[ERROR] Data preparation failed: {e}")
+        print(f"Error. Data preparation failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None, None
 
     yvar = "value"
@@ -1578,11 +1682,11 @@ def get_localised_forecast(
 
     try:
         diff = loc_dt[fvar].mean() / loc_dt[yvar].mean()
-        funcs.log_if_condition((diff > 2), f"UNIT ERROR: GEOS CF IS HIGHER BY: {diff} IN LOCATION: {loc} SPECIES: {spec.lower()}")
+        funcs.log_if_condition((diff > 2), f"UNIT Error. GEOS CF IS HIGHER BY: {diff} IN LOCATION: {loc} SPECIES: {spec.lower()}")
     except Exception:
         pass
 
-    skipvar = ["time", "location", "lat", "lon", "totcol_co", "totcol_hcho", "totcol_no2", "totcol_o3", "totcol_so2", "tropcol_co", "tropcol_hcho", "tropcol_o3", "tropcol_so2"]
+    skipvar = ["time", "location", "lat", "lon"]
     blacklist = skipvar + [yvar]
 
     try:
@@ -1597,7 +1701,7 @@ def get_localised_forecast(
             anomalies = model_IF.predict(conc_obs)
             loc_dt = loc_dt[anomalies != 1]
     except Exception as e:
-        print(f"[ERROR] Outlier removal failed: {e}")
+        print(f"Error. Outlier removal failed: {e}")
         return None, None, None
 
     # Feature selection
@@ -1607,7 +1711,7 @@ def get_localised_forecast(
         x = loc_dt[sel_feats]
         y = loc_dt[yvar]
     except Exception as e:
-        print(f"[ERROR] Feature selection failed: {e}")
+        print(f"Error. Feature selection failed: {e}")
         return None, None, None
 
     # Split and clean
@@ -1618,61 +1722,394 @@ def get_localised_forecast(
         tx = funcs.clean_feature_names(tx)
         vx = funcs.clean_feature_names(vx)
     except Exception as e:
-        print(f"[ERROR] Data split/clean failed: {e}")
+        print(f"Error Data split/clean failed: {e}")
         return None, None, None
 
-    model_path = f"MODELS/lgbm_{loc}_{spec}.joblib"
-    use_pretrained = os.path.exists(model_path) and not force_retrain
-    if use_pretrained:
+    model_v1_path = f"MODELS/lgbm_{loc}_{spec}_v1.joblib"
+    model_v2_path = f"MODELS/lgbm_{loc}_{spec}_v2.joblib"
+    feature_v1_file = f"MODELS/lgbm_{loc}_{spec}_v1_features.pkl"
+    feature_file = f"MODELS/lgbm_{loc}_{spec}_features.pkl"
+    
+    # skip re-training
+    use_pretrained_v2 = os.path.exists(model_v2_path) and not force_retrain
+    
+    if use_pretrained_v2:
         if not silent:
-            print(f"Loading pretrained model from {model_path}")
-        model_lgb = joblib.load(model_path)
-    else:
-        rs_params = {
-            'num_leaves': [15, 31, 63],
-            'max_depth': [3, 5, 7],
-            'learning_rate': [0.01, 0.05, 0.1],
-            'n_estimators': [100, 300, 500],
-            'reg_alpha': [0, 0.1, 0.5],
-            'reg_lambda': [0, 0.1, 0.5]
-        }
+            print(f"Loading pretrained V2 model from {model_v2_path}")
+        model_lgb = joblib.load(model_v2_path)
         try:
-            rs = RandomizedSearchCV(lgb.LGBMRegressor(verbosity=-1), rs_params, n_iter=10, cv=3, scoring='neg_mean_squared_error', n_jobs=-1, error_score='raise', random_state=42)
-            rs.fit(tx, ty)
-            if not silent:
-                print(f"Best params: {rs.best_params_}")
-            from lightgbm import early_stopping
-            model_lgb = lgb.LGBMRegressor(**rs.best_params_, verbosity=-1)
-            model_lgb.fit(tx, ty, eval_set=[(vx, vy)], callbacks=[early_stopping(stopping_rounds=20, verbose=0)])
-            joblib.dump(model_lgb, model_path)
-            if not silent:
-                print(f"Model trained and saved to {model_path}")
+            import pickle
+            if os.path.exists(feature_file):
+                sel_feats = pickle.load(open(feature_file, 'rb'))
+                if not silent:
+                    print(f"Loaded feature set: {len(sel_feats)} features")
+            else:
+                # Fall back to current feature selection
+                corrs = loc_dt.corr()[yvar].drop(yvar)
+                sel_feats = [col for col in corrs.index if abs(corrs[col]) > 0.1 and col not in blacklist]
         except Exception as e:
-            print(f"[ERROR] Model tuning/training failed: {e}")
-            return None, None, None
+            if not silent:
+                print(f"WARNING: Could not load features: {e}, using current feature selection")
+            corrs = loc_dt.corr()[yvar].drop(yvar)
+            sel_feats = [col for col in corrs.index if abs(corrs[col]) > 0.1 and col not in blacklist]
+    else:
+        # ============================================================
+        # Train or Load V1 Base Model
+        # ============================================================
+        use_pretrained_v1 = os.path.exists(model_v1_path) and not force_retrain
+        
+        if use_pretrained_v1:
+            if not silent:
+                print(f"Loading pretrained V1 model from {model_v1_path}")
+            model_lgb_v1 = joblib.load(model_v1_path)
+            
+            # Load the feature set that was used for V1
+            try:
+                import pickle
+                if os.path.exists(feature_v1_file):
+                    sel_feats_v1 = pickle.load(open(feature_v1_file, 'rb'))
+                    if not silent:
+                        print(f"Loaded V1 feature set: {len(sel_feats_v1)} features")
+                else:
+                    # Fall back to current feature selection
+                    if not silent:
+                        print(f"WARNING: V1 feature file not found, using current feature selection")
+                    corrs_v1 = loc_dt.corr()[yvar].drop(yvar)
+                    sel_feats_v1 = [col for col in corrs_v1.index if abs(corrs_v1[col]) > 0.1 and col not in blacklist]
+            except Exception as e:
+                if not silent:
+                    print(f"WARNING: Could not load V1 features: {e}")
+                corrs_v1 = loc_dt.corr()[yvar].drop(yvar)
+                sel_feats_v1 = [col for col in corrs_v1.index if abs(corrs_v1[col]) > 0.1 and col not in blacklist]
+        else:
+            # Train new V1 model
+            if not silent:
+                print(f"Training base model on V1 data")
+            
+            # Filter training data for V1 period (use v1_end from data fetching)
+            v1_end_date = datetime.now() - timedelta(days=60)  # Same as v1_end from data fetching
+            v1_train_mask = loc_dt['time'] <= v1_end_date
+            loc_dt_v1 = loc_dt[v1_train_mask].copy()
+            
+            if len(loc_dt_v1) < 100:
+                if not silent:
+                    print(f"WARNING: Insufficient V1 training data ({len(loc_dt_v1)} samples). Using all available data.")
+                loc_dt_v1 = loc_dt.copy()
+            
+            # Feature selection on V1 data
+            corrs_v1 = loc_dt_v1.corr()[yvar].drop(yvar)
+            sel_feats_v1 = [col for col in corrs_v1.index if abs(corrs_v1[col]) > 0.1 and col not in blacklist]
+            x_v1 = loc_dt_v1[sel_feats_v1]
+            y_v1 = loc_dt_v1[yvar]
+            
+            tx_v1, vx_v1, ty_v1, vy_v1 = train_test_split(x_v1, y_v1, test_size=0.3, random_state=7)
+            tx_v1, ty_v1 = funcs.clean_data(tx_v1, ty_v1)
+            vx_v1, vy_v1 = funcs.clean_data(vx_v1, vy_v1)
+            tx_v1 = funcs.clean_feature_names(tx_v1)
+            vx_v1 = funcs.clean_feature_names(vx_v1)
+            
+            rs_params = {
+                'num_leaves': [15, 31, 63],
+                'max_depth': [3, 5, 7],
+                'learning_rate': [0.01, 0.05, 0.1],
+                'n_estimators': [100, 300, 500],
+                'reg_alpha': [0, 0.1, 0.5],
+                'reg_lambda': [0, 0.1, 0.5]
+            }
+            
+            try:
+                rs = RandomizedSearchCV(lgb.LGBMRegressor(verbosity=-1), rs_params, n_iter=10, cv=3, 
+                                       scoring='neg_mean_squared_error', n_jobs=-1, error_score='raise', random_state=42)
+                rs.fit(tx_v1, ty_v1)
+                if not silent:
+                    print(f"Best V1 features: {rs.best_params_}")
+                
+                from lightgbm import early_stopping
+                model_lgb_v1 = lgb.LGBMRegressor(**rs.best_params_, verbosity=-1)
+                model_lgb_v1.fit(tx_v1, ty_v1, eval_set=[(vx_v1, vy_v1)], callbacks=[early_stopping(stopping_rounds=20, verbose=0)])
+                
+                # Save V1 model and features for future 
+                joblib.dump(model_lgb_v1, model_v1_path)
+                import pickle
+                pickle.dump(sel_feats_v1, open(feature_v1_file, 'wb'))
+                
+                if not silent:
+                    print(f"V1 base model saved to {model_v1_path}")
+                    print(f"V1 features saved to {feature_v1_file}")
+                    print(f"Next time, V1 training will be skipped")
+            except Exception as e:
+                print(f"Error !V1 model training failed: {e}")
+                import traceback
+                traceback.print_exc()
+                return None, None, None
+        
+        # Step 2: Transfer learning on V2 data
+        if not silent:
+            print(f"Step 2: Transfer learning with V2 data...")
+        
+        # Filter for V2 period (recent data - same as v2_start from data fetching)
+        v2_start_date = datetime.now() - timedelta(days=60)  # Same as v2_start from data fetching
+        v2_mask = loc_dt['time'] >= v2_start_date
+        loc_dt_v2 = loc_dt[v2_mask].copy()
+        
+        if len(loc_dt_v2) < 50:
+            if not silent:
+                print(f"WARNING: Limited V2 data ({len(loc_dt_v2)} samples). Using V1 model only.")
+            model_lgb = model_lgb_v1
+        else:
+            # Use same features as GEOS-CF V1
+            sel_feats = [f for f in sel_feats_v1 if f in loc_dt_v2.columns]
+            x_v2 = loc_dt_v2[sel_feats]
+            y_v2 = loc_dt_v2[yvar]
+            
+            tx_v2, vx_v2, ty_v2, vy_v2 = train_test_split(x_v2, y_v2, test_size=0.3, random_state=7)
+            tx_v2, ty_v2 = funcs.clean_data(tx_v2, ty_v2)
+            vx_v2, vy_v2 = funcs.clean_data(vx_v2, vy_v2)
+            tx_v2 = funcs.clean_feature_names(tx_v2)
+            vx_v2 = funcs.clean_feature_names(vx_v2)
+            
+            # Fine-tune the V1 model with V2 data (lower learning rate for transfer learning)
+            model_lgb = lgb.LGBMRegressor(
+                **{**rs.best_params_, 'learning_rate': rs.best_params_.get('learning_rate', 0.05) * 0.5},
+                verbosity=-1
+            )
+            
+            # Initialize with V1 model weights by using init_model parameter
+            model_lgb.fit(tx_v2, ty_v2, eval_set=[(vx_v2, vy_v2)], 
+                         init_model=model_lgb_v1,
+                         callbacks=[early_stopping(stopping_rounds=10, verbose=0)])
+            
+            # Save V2 model and features
+            joblib.dump(model_lgb, model_v2_path)
+            import pickle
+            pickle.dump(sel_feats, open(feature_file, 'wb'))
+            
+            if not silent:
+                print(f"V2 transfer learning model saved to {model_v2_path}")
+                print(f"V2 features saved to {feature_file}")
+                print(f"Next time, both V1 and V2 training will be skipped (instant load!)")
+        
+        # Use the combined feature set for consistency
+        sel_feats = sel_feats_v1
 
+    # Validate final model performance
     try:
-        vy_pred = model_lgb.predict(vx)
-        rmse = round(root_mean_squared_error(vy, vy_pred), 2)
-        r2 = round(r2_score(vy, vy_pred), 2)
-        mae = round(mean_absolute_error(vy, vy_pred), 2)
+        # Use most recent data for validation
+        recent_mask = loc_dt['time'] >= (datetime.now() - timedelta(days=90))
+        loc_dt_recent = loc_dt[recent_mask].copy() if recent_mask.sum() > 50 else loc_dt.copy()
+        
+        x_recent = loc_dt_recent[sel_feats]
+        y_recent = loc_dt_recent[yvar]
+        
+        _, vx_final, _, vy_final = train_test_split(x_recent, y_recent, test_size=0.3, random_state=7)
+        vx_final, vy_final = funcs.clean_data(vx_final, vy_final)
+        vx_final = funcs.clean_feature_names(vx_final)
+        
+        vy_pred = model_lgb.predict(vx_final)
+        rmse = round(root_mean_squared_error(vy_final, vy_pred), 2)
+        r2 = round(r2_score(vy_final, vy_pred), 2)
+        mae = round(mean_absolute_error(vy_final, vy_pred), 2)
         metrics = {'RMSE': rmse, 'R2': r2, 'MAE': mae}
         if not silent:
-            print(f"Model performance: RMSE={rmse}, R2={r2}, MAE={mae}")
+            print(f"Final model performance: RMSE={rmse}, R2={r2}, MAE={mae}")
             print(f"Selected features: {sel_feats}")
-        funcs.log_if_condition((r2 < 0.5), f"MODEL ERROR: MODEL RUNS POORLY IN THIS LOCATION: R2: {r2} ; RMSE: {rmse} IN LOCATION: {loc} SPECIES: {spec.lower()}")
+        funcs.log_if_condition((r2 < 0.5), f"MODEL Error !MODEL RUNS POORLY IN THIS LOCATION: R2: {r2} ; RMSE: {rmse} IN LOCATION: {loc} SPECIES: {spec.lower()}")
     except Exception as e:
-        print(f"[ERROR] Metrics calculation failed: {e}")
+        print(f"Error. Metrics calculation failed: {e}")
         metrics = None
 
+    # Make predictions on V2 forecast data only
     try:
         pred_dt["time"] = [dt.datetime(i.year, i.month, i.day, i.hour, 0, 0) for i in pred_dt["time"]]
+        
+        # Ensure selected features exist in pred_dt
+        missing_feats = [f for f in sel_feats if f not in pred_dt.columns]
+        if missing_feats:
+            if not silent:
+                print(f"WARNING: Missing features in forecast data: {missing_feats}")
+            # Only use features that exist in pred_dt
+            sel_feats = [f for f in sel_feats if f in pred_dt.columns]
+            if not silent:
+                print(f"Reduced to {len(sel_feats)} features that exist in forecast data")
+        
+        # Check for non-null values in each feature
+        null_counts = pred_dt[sel_feats].isnull().sum()
+        
+        # Filter out features that are usualy not available
+        features_with_data = [f for f in sel_feats if null_counts[f] < len(pred_dt)]
+        completely_null_feats = [f for f in sel_feats if null_counts[f] == len(pred_dt)]
+        
+        if completely_null_feats:
+            if not silent:
+                print(f"WARNING: Removing {len(completely_null_feats)} features with NO forecast data: {completely_null_feats}")
+            sel_feats = features_with_data
+            if not silent:
+                print(f"[NFO: Using {len(sel_feats)} features with available forecast data")
+        
+        # Verify we have at least some features
+        if len(sel_feats) == 0:
+            raise ValueError(f"No features available for prediction! All features are missing from forecast data.")
+        
+        if not silent:
+            remaining_null_counts = pred_dt[sel_feats].isnull().sum()
+            if (remaining_null_counts > 0).any():
+                print(f": Null counts in remaining features:\n{remaining_null_counts[remaining_null_counts > 0]}")
+            print(f": pred_dt shape: {pred_dt.shape}, columns: {len(pred_dt.columns)}")
+            print(f": Final features for prediction ({len(sel_feats)}): {sel_feats}")
+        
+        # Warn if using significantly fewer features than trained on
+        original_feature_count = len([f for f in sel_feats if f not in completely_null_feats]) if 'completely_null_feats' in locals() else len(sel_feats)
+        if completely_null_feats and not silent:
+            pct_removed = (len(completely_null_feats) / (len(sel_feats) + len(completely_null_feats))) * 100
+            print(f"WARNING: Predicting with {pct_removed:.1f}% fewer features than trained model expects")
+            print(f"Model may be less accurate. Consider retraining with only V2-available features.")
+        
+        # Create mask for rows with all non-null features
         pred_mask = pred_dt[sel_feats].notnull().all(axis=1)
+        n_valid = pred_mask.sum()
+        
+        if not silent:
+            print(f"Valid prediction rows (all features non-null): {n_valid} / {len(pred_dt)}")
+        
         pred_dt["localised"] = np.nan
-        pred_dt.loc[pred_mask, "localised"] = model_lgb.predict(pred_dt.loc[pred_mask, sel_feats])
+        
+        if n_valid > 0:
+            # Get the subset to predict on
+            X_pred = pred_dt.loc[pred_mask, sel_feats].copy()
+            
+            if not silent:
+                print(f" X_pred shape before clean_feature_names: {X_pred.shape}")
+                print(f" X_pred columns: {list(X_pred.columns)}")
+                print(f" X_pred dtypes:\n{X_pred.dtypes}")
+                print(f" X_pred sample:\n{X_pred.head()}")
+            
+            # Verify X_pred is valid
+            if X_pred.empty or X_pred.shape[0] == 0 or X_pred.shape[1] == 0:
+                if not silent:
+                    print(f"Error. X_pred is empty after masking! Shape: {X_pred.shape}")
+                    print(f": pred_mask details: {pred_mask.value_counts()}")
+                raise ValueError(f"Prediction data is empty after filtering. Shape: {X_pred.shape}")
+            
+            X_pred = funcs.clean_feature_names(X_pred)
+            
+            if not silent:
+                print(f":X_pred shape after clean_feature_names: {X_pred.shape}")
+                print(f":X_pred columns after cleaning: {list(X_pred.columns)}")
+            
+            # Verify X_pred is still valid after cleaning
+            if X_pred.empty or X_pred.shape[0] == 0 or X_pred.shape[1] == 0:
+                if not silent:
+                    print(f"Error. X_pred became empty after clean_feature_names! Shape: {X_pred.shape}")
+                raise ValueError(f"Prediction data became empty after cleaning feature names. Shape: {X_pred.shape}")
+            
+            # LightGBM models
+            model_features = model_lgb.feature_name_
+            X_pred_aligned = X_pred.copy()
+            
+            missing_from_pred = [f for f in model_features if f not in X_pred_aligned.columns]
+            if missing_from_pred:
+                if not silent:
+                    print(f"WARNING: Adding {len(missing_from_pred)} missing features as zeros: {missing_from_pred[:5]}...")
+                for feat in missing_from_pred:
+                    X_pred_aligned[feat] = 0.0
+            
+            # Reorder columns to match model's expected feature order
+            X_pred_aligned = X_pred_aligned[model_features]
+            
+            if not silent:
+                print(f": Aligned prediction data shape: {X_pred_aligned.shape}")
+            
+            # predictions loop
+            predictions = model_lgb.predict(X_pred_aligned)
+            pred_dt.loc[pred_mask, "localised"] = predictions
+            
+            if not silent:
+                print(f"Generated {len(predictions)} localised forecasts from V2 data")
+        else:
+            if not silent:
+                print(f"WARNING: No valid rows for prediction - all forecast rows have missing features")
+                print(f"Forecast data time range: {pred_dt['time'].min()} to {pred_dt['time'].max()}")
+                print(f"Consider checking if forecast data is available for future dates")
+        
+        # Add raw model forecast columns to pred_dt for merging
+        for col in ["no2", "o3", "pm25_rh35_gcc", "pm25_rh35", "rh", "t", "tprec", "hcho", "co"]:
+            if col not in pred_dt.columns:
+                pred_dt[col] = np.nan
     except Exception as e:
-        print(f"[ERROR] Prediction failed: {e}")
+        print(f"Error. Prediction failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None, metrics, model_lgb
+
+    # ================================================================
+    # Generate localised predictions for the entire continuous dataframe
+    # (historical + recent + forecast - all from site._mod)
+    # ================================================================
+    if not silent:
+        print(f"Generating localised predictions for entire time series...")
+    
+    try:
+        # Use the continuous dataframe (V1 + V2) from site._mod
+        continuous_dt = site._mod.copy()
+        continuous_dt["time"] = pd.to_datetime(continuous_dt["time"])
+        continuous_dt["time"] = [dt.datetime(i.year, i.month, i.day, i.hour, 0, 0) for i in continuous_dt["time"]]
+        
+        # Filter to features available in continuous data
+        cont_sel_feats = [f for f in sel_feats if f in continuous_dt.columns]
+        
+        # Check for completely null features
+        cont_null_counts = continuous_dt[cont_sel_feats].isnull().sum()
+        cont_features_with_data = [f for f in cont_sel_feats if cont_null_counts[f] < len(continuous_dt)]
+        cont_completely_null = [f for f in cont_sel_feats if cont_null_counts[f] == len(continuous_dt)]
+        
+        if cont_completely_null and not silent:
+            print(f"Removing {len(cont_completely_null)} features with no data: {cont_completely_null}")
+        
+        cont_sel_feats = cont_features_with_data
+        
+        if len(cont_sel_feats) > 0:
+            # Create mask for valid rows
+            cont_pred_mask = continuous_dt[cont_sel_feats].notnull().all(axis=1)
+            n_cont_valid = cont_pred_mask.sum()
+            
+            if not silent:
+                print(f"Valid prediction rows: {n_cont_valid} / {len(continuous_dt)}")
+            
+            continuous_dt["localised"] = np.nan
+            
+            if n_cont_valid > 0:
+                # Prepare data for prediction
+                X_cont = continuous_dt.loc[cont_pred_mask, cont_sel_feats].copy()
+                X_cont = funcs.clean_feature_names(X_cont)
+                
+                # Align features with model expectations
+                model_features = model_lgb.feature_name_
+                X_cont_aligned = X_cont.copy()
+                
+                missing_from_cont = [f for f in model_features if f not in X_cont_aligned.columns]
+                if missing_from_cont:
+                    for feat in missing_from_cont:
+                        X_cont_aligned[feat] = 0.0
+                
+                X_cont_aligned = X_cont_aligned[model_features]
+                
+                # Make predictions for entire time series
+                cont_predictions = model_lgb.predict(X_cont_aligned)
+                continuous_dt.loc[cont_pred_mask, "localised"] = cont_predictions
+                
+                if not silent:
+                    print(f"Generated {len(cont_predictions)} localised predictions for continuous time series")
+                    print(f"Time range: {continuous_dt['time'].min()} to {continuous_dt['time'].max()}")
+        else:
+            if not silent:
+                print(f"WARNING: No valid features for predictions")
+            continuous_dt["localised"] = np.nan
+    except Exception as e:
+        if not silent:
+            print(f"WARNING: Prediction generation failed: {e}")
+        continuous_dt = site._mod.copy()
+        continuous_dt["time"] = pd.to_datetime(continuous_dt["time"])
+        continuous_dt["localised"] = np.nan
 
     obs = site._obs[["time", "value"]].copy()
     obs["time"] = [dt.datetime(i.year, i.month, i.day, i.hour, 0, 0) for i in obs["time"]]
@@ -1683,14 +2120,55 @@ def get_localised_forecast(
             return df.drop(['value_x', 'value_y'], axis=1)
         return df
 
-    merge_list = [pred_dt, obs]
+    # Merge continuous GEOS-CF data (V1+V2) with observations
     try:
-        merged_data = funcs.merge_dataframes(merge_list, index_col="time", resample=resamp, how="outer")
+        # Standardize time columns
+        continuous_dt["time"] = pd.to_datetime(continuous_dt["time"]).dt.floor("H")
+        obs["time"] = pd.to_datetime(obs["time"]).dt.floor("H")
+        
+        # Merge the single continuous dataframe with observations
+        merged_data = funcs.merge_dataframes([continuous_dt, obs], index_col="time", resample=resamp, how="outer")
         merged_data = clean_merged_values(merged_data)
+        
+        # Interpolate observation values to fill nighttime gaps (for Pandora)
+        if interpol and obs_src.lower() in ['pandora', 'sun-dependent']:
+            if 'value' in merged_data.columns:
+                n_missing_before = merged_data['value'].isna().sum()
+                if n_missing_before > 0:
+                    # Set time as index temporarily for time-aware interpolation
+                    if 'time' in merged_data.columns:
+                        merged_data_indexed = merged_data.set_index('time')
+                        merged_data_indexed['value'] = merged_data_indexed['value'].interpolate(
+                            method='time', 
+                            limit=12,  # Maximum 12 consecutive hours to interpolate
+                            limit_direction='both'
+                        )
+                        merged_data = merged_data_indexed.reset_index()
+                    else:
+                        # Fallback to linear interpolation if time is not a column
+                        merged_data['value'] = merged_data['value'].interpolate(
+                            method='linear', 
+                            limit=12,
+                            limit_direction='both'
+                        )
+                    
+                    n_missing_after = merged_data['value'].isna().sum()
+                    n_filled = n_missing_before - n_missing_after
+                    if not silent and n_filled > 0:
+                        print(f"Interpolated {n_filled} observation values to fill nighttime gaps (limit: 12 hours)")
+        
+        # Ensure all forecast columns are present in merged_data
+        for col in ["no2", "localised", "o3", "pm25_rh35_gcc", "rh", "t10m", "tprec", "hcho", "value"]:
+            if col not in merged_data.columns:
+                merged_data[col] = np.nan
         if not silent:
             print("merged_data time range:", merged_data["time"].min(), merged_data["time"].max())
+
+
     except Exception as e:
-        print(f"[ERROR] Merging failed: {e}")
+        print(f"Error. Merging failed: {e}")
+        import traceback
+        traceback.print_exc()
         merged_data = None
     return merged_data, metrics, model_lgb
 
@@ -2023,64 +2501,65 @@ def read_pandora(url, pollutant='no2'):
     return result_df[["time","lat","lon","value","location"]]
 
 
-def read_merra2_cnn(base_url=MERRA2CNN, site=None, frequency=30, lat=None, lon=None,
-                     save_as_json=False, output_file="./output/db/global.json", silent=True):
+def read_geos_fp_cnn(base_url=MERRA2CNN, site=None, frequency=30, lat=None, lon=None, silent=True, skip_geosfp = False):
     
-    end_date = datetime.today()
+    end_date = datetime.today() + timedelta(days=5)
     start_date = end_date - timedelta(days=frequency)
     all_data = pd.DataFrame()
 
     # Fetch MERRA2 data for the date range
-    for n in range(frequency + 3):
-        date = start_date + timedelta(days=n)
-        url = f"{base_url}?year={date.year}&month={date.month}&day={date.day}&site={site}"
+    if not skip_geosfp:
+        for n in range(frequency + 3):
+            date = start_date + timedelta(days=n)
+            url = f"{base_url}?year={date.year}&month={date.month}&day={date.day}&site={site}"
 
-        if not silent:
-            print(f"Fetching data for {date.strftime('%Y-%m-%d')} from {url}")
+            if not silent:
+                print(f"Fetching data for {date.strftime('%Y-%m-%d')} from {url}")
 
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            text = soup.body.get_text()
+            try:
+                response = requests.get(url)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
+                text = soup.body.get_text()
 
-            df = pd.read_csv(io.StringIO(text))
-            if df.empty:
-                if not silent:
-                    print("Warning: Empty DataFrame retrieved.")
-                continue
-
-            reshaped_data = []
-            for _, row in df.iterrows():
-                try:
-                    base_date = pd.to_datetime(row['UTC_DATE'])
-                    for hour_offset, conc_col, aqi_col in zip(
-                        [1, 4, 7, 10, 13, 16, 19, 22],
-                        ['3HR_PM_CONC_CNN(130)', '3HR_PM_CONC_CNN(430)', '3HR_PM_CONC_CNN(730)', 
-                         '3HR_PM_CONC_CNN(1030)', '3HR_PM_CONC_CNN(1330)', '3HR_PM_CONC_CNN(1630)', 
-                         '3HR_PM_CONC_CNN(1930)', '3HR_PM_CONC_CNN(2230)'],
-                        ['3HR_AQI(130)', '3HR_AQI(430)', '3HR_AQI(730)', '3HR_AQI(1030)', 
-                         '3HR_AQI(1330)', '3HR_AQI(1630)', '3HR_AQI(1930)', '3HR_AQI(2230)']
-                    ):
-                        timestamp = base_date + timedelta(hours=hour_offset)
-                        reshaped_data.append({
-                            'time': timestamp,
-                            'pm25_conc_cnn': row.get(conc_col, None),
-                            'pm25_aqi': row.get(aqi_col, None),
-                            'Station': row.get('Station', None),
-                            'Site_Name': row.get('Site_Name', None)
-                        })
-                except Exception as row_err:
+                df = pd.read_csv(io.StringIO(text))
+                if df.empty:
                     if not silent:
-                        print(f"Row processing error: {row_err}")
+                        print("Warning: Empty DataFrame retrieved.")
                     continue
 
-            reshaped_df = pd.DataFrame(reshaped_data)
-            all_data = pd.concat([all_data, reshaped_df], ignore_index=True)
+                reshaped_data = []
+                for _, row in df.iterrows():
+                    try:
+                        base_date = pd.to_datetime(row['UTC_DATE'])
+                        for hour_offset, conc_col, aqi_col in zip(
+                            [1, 4, 7, 10, 13, 16, 19, 22],
+                            ['3HR_PM_CONC_CNN(130)', '3HR_PM_CONC_CNN(430)', '3HR_PM_CONC_CNN(730)', 
+                             '3HR_PM_CONC_CNN(1030)', '3HR_PM_CONC_CNN(1330)', '3HR_PM_CONC_CNN(1630)', 
+                             '3HR_PM_CONC_CNN(1930)', '3HR_PM_CONC_CNN(2230)'],
+                            ['3HR_AQI(130)', '3HR_AQI(430)', '3HR_AQI(730)', '3HR_AQI(1030)', 
+                             '3HR_AQI(1330)', '3HR_AQI(1630)', '3HR_AQI(1930)', '3HR_AQI(2230)']
+                        ):
+                            timestamp = base_date + timedelta(hours=hour_offset)
+                            reshaped_data.append({
+                                'time': timestamp,
+                                'pm25_conc_cnn': row.get(conc_col, None),
+                                'pm25_aqi': row.get(aqi_col, None),
+                                'Station': row.get('Station', None),
+                                'Site_Name': row.get('Site_Name', None)
+                            })
+                    except Exception as row_err:
+                        if not silent:
+                            print(f"Row processing Error. {row_err}")
+                        continue
 
-        except Exception as e:
-            if not silent:
-                print(f"Failed to fetch data for {date.strftime('%Y-%m-%d')}: {e}")
+                reshaped_df = pd.DataFrame(reshaped_data)
+                all_data = pd.concat([all_data, reshaped_df], ignore_index=True)
+
+            except Exception as e:
+                if not silent:
+                    print(f"Failed to fetch data for {date.strftime('%Y-%m-%d')}: {e}")
+                    continue
 
     # If all_data is empty, fill with nulls for expected columns so it can merge with geos_cf
     if all_data.empty:
@@ -2099,33 +2578,62 @@ def read_merra2_cnn(base_url=MERRA2CNN, site=None, frequency=30, lat=None, lon=N
     if not silent:
         print("Requesting GEOS-CF...")
 
-    geos_cf = read_geoscf(
-        ilon=lon,
-        ilat=lat,
-        start=datetime.today() - timedelta(days=30),
-        end=datetime.today() + timedelta(days=3),
-        resample="3H",
-        source="s3"
+    geos_cf = mlpred.read_geos_cf(
+        lon=lon,
+        lat=lat,
+        start=datetime.today() - timedelta(days=frequency),
+        end=datetime.today() + timedelta(days=10),
+        version = 2
     )
 
     # Merge and process data
-    merg = mlpred.funcs.merge_dataframes([all_data, geos_cf], "time", resample="3h", how="outer")
+    merg = funcs.merge_dataframes([all_data, geos_cf], "time", resample="3h", how="outer")
+    print(merg.columns.to_list())
 
-    species_map = {'PM2.5': 'pm25_rh35_gcc', 'NO2': 'no2', 'O3': 'o3'}
+    # Fill missing MERRA-2 values with GEOS-CF values after merge
+    if not silent:
+        print("Filling missing MERRA-2 values with GEOS-CF data...")
+    
+    # Track what was filled for reporting
+    filled_counts = {}
+    
+    # Fill pm25_conc_cnn with GEOS-CF PM2.5 if missing
+    if 'pm25_conc_cnn' in merg.columns and 'pm25_rh35' in merg.columns:
+        missing_mask = merg['pm25_conc_cnn'].isna()
+        n_missing = missing_mask.sum()
+        if n_missing > 0:
+            merg.loc[missing_mask, 'pm25_conc_cnn'] = merg.loc[missing_mask, 'pm25_rh35']
+            filled_counts['pm25_conc_cnn'] = n_missing
+            if not silent:
+                print(f"  - Filled {n_missing} missing pm25_conc_cnn values with pm25_rh35_gcc")
+
+    # Calculate NowCast and AQI
+    species_map = {'PM2.5': 'pm25_rh35', 'NO2': 'no2', 'O3': 'o3'}
     avg_hours = {'NO2': 3, 'O3': 1}
     merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)
+
+    # Fill missing pm25_aqi with GEOS-CF PM25_NowCast_AQI if available
+    if 'pm25_aqi' in merg.columns and 'PM25_NowCast_AQI' in merg.columns:
+        missing_mask = merg['pm25_aqi'].isna()
+        n_missing = missing_mask.sum()
+        if n_missing > 0:
+            merg.loc[missing_mask, 'pm25_aqi'] = merg.loc[missing_mask, 'PM25_NowCast_AQI']
+            filled_counts['pm25_aqi'] = n_missing
+            if not silent:
+                print(f"  - Filled {n_missing} missing pm25_aqi values with PM25_NowCast_AQI")
+    
+    # Summary of filling operations
+    if not silent and filled_counts:
+        print(f"Summary: Filled missing values - {filled_counts}")
+    elif not silent:
+        print("No missing values needed to be filled from GEOS-CF")
 
     if not silent:
         print("Final merged columns:", merg.columns)
 
     # Convert timestamps if needed
-    all_data = convert_times_column(merg, 'time', lat, lon)
+    all_data = funcs.convert_times_column(merg, 'time', lat, lon)
 
-    # Optionally save
-    if save_as_json:
-        all_data.to_json(output_file, orient='records', date_format='iso')
-        if not silent:
-            print(f"Saved output to {output_file}")
 
     return all_data
 
@@ -3279,10 +3787,10 @@ def get_location_sensors(location_id, api_key=OPENAQAPI, parameter=None, max_ret
             if res.status_code == 429:
                 time.sleep(base_delay * (2 ** attempt) + random.random())
             else:
-                print(f"HTTP error: {e}")
+                print(f"HTTP Error. {e}")
                 break
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error. {e}")
             break
 
     print(f"Failed to retrieve sensor data for location {location_id}")
@@ -3391,250 +3899,171 @@ def pandora_maps(url, showtext = False, save_path='./plots', title =None, srcs =
     plt.savefig(save_path, dpi=300)
     plt.show()
     
-    
-    
-def read_geoscf(
-    ilon,
-    ilat,
-    start,
-    end,
-    resample=None,
-    source=None,
-    template=None,
-    collections=None,
-    remove_outlier=0,
-    gases=DEFAULT_GASES,
-    modsrc=None,
-    silent=False,
-    **kwargs,
-):
+def read_geos_cf(lon, lat, start=None, end=None, version=2, use_cache=True, verbose=True):
     """
-    Read model data from various sources.
-
+    Read GEOS-CF model data from S3 with caching support.
+    
+    Caching Strategy:
+    - Saves replay data (historical) to CSV: GEOS_CF/loc_{lat}_{lon}_v{version}.csv
+    - On subsequent calls: loads cached replay, only fetches new analysis/forecast
+    - Significantly reduces S3 read time (replay is ~6+ years of data)
+    
     Parameters
     ----------
-    ilon : float
-        Site longitude
-    ilat : float
-        Site latitude
-    start : datetime
-        Start date of data
-    end : datetime
-        End date of data
-    resample : str, optional
-        Resample frequency (e.g. "5D" for 5-day mean)
-    source : str, optional
-        Source type ("opendap", "nc4", "zarr", "s3", "local", "pandora")
-    template : str or list, optional
-        Template(s) for file paths or URLs
-    collections : list, optional
-        List of model collections (for "nc4" source)
-    remove_outlier : int, optional
-        Not used in this function (kept for compatibility)
-    gases : list, optional
-        List of gases to convert from v/v to ppbv
-    modsrc : str, optional
-        Default source if source is None
-    silent : bool, optional
-        If True, suppress print statements
-    **kwargs :
-        Additional keyword arguments (e.g. url for local or pandora sources)
-
+    lon, lat : float
+        Location coordinates
+    start, end : datetime, optional
+        Date range filter
+    version : int, default=2
+        GEOS-CF version (1 or 2)
+    use_cache : bool, default=True
+        If True, uses cached replay data and only fetches new analysis/forecast
+    verbose : bool, default=True
+        If True, prints progress messages
+    
     Returns
     -------
     pandas.DataFrame
-        DataFrame containing the model data
+        Data with species in ppbv and time features
+    
+    Examples
+    --------
+    >>> # First call: reads all data from S3, saves replay to cache
+    >>> df = read_geoscf(lon=-77.0, lat=38.9, version=2)
+    
+    >>> # Subsequent calls: loads replay from cache, only fetches new data
+    >>> df = read_geoscf(lon=-77.0, lat=38.9, version=2)  # Much faster!
     """
+    # Create cache directory if it doesn't exist
+    if use_cache:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+    
+    # filename
+    lat_str = f"{lat:.6f}".replace('.', '_').replace('-', 'm')
+    lon_str = f"{lon:.6f}".replace('.', '_').replace('-', 'm')
+    cache_file = os.path.join(CACHE_DIR, f"loc_{lat_str}_{lon_str}_v{version}.csv")
+    
+    # S3 paths
+    paths = {
+        1: [S3_TEMPLATE, S3_REPLAY_TEMPLATE, S3_FORECASTS_TEMPLATE],
+        2: [S3_V2_RPL, S3_V2_COLS, S3_V2_FCST]
+    }[version]
+    
+    df_replay = None
+    
+    # load cached replay data
+    if use_cache and os.path.exists(cache_file):
+        try:
+            if verbose:
+                print(f"Loading cached replay data from {cache_file}")
+            df_replay = pd.read_csv(cache_file, parse_dates=['time'])
+            if verbose:
+                print(f"Loaded {len(df_replay)} cached rows (from {df_replay['time'].min()} to {df_replay['time'].max()})")
+        except Exception as e:
+            if verbose:
+                print(f"Warning: Could not load cache file: {e}. Will fetch from S3.")
+            df_replay = None
+    
+    # Read all sources
     dfs = []
-    source = modsrc if source is None else source
+    
 
-    if source == "opendap":
-        template = OPENDAP_TEMPLATE if template is None else template
-        template = template if isinstance(template, list) else [template]
-        for t in template:
-            if not silent:
-                print(f"Reading {t}...")
-            ds = (
-                xr.open_dataset(t)
-                .sel(lon=ilon, lat=ilat, lev=1, method="nearest")
-                .sel(time=slice(start, end))
-                .load()
-            )
-            df = ds.to_dataframe().reset_index()
-            dfs.append(df)
-
-    elif source == "nc4":
-        template = M2_TEMPLATE if template is None else template
-        collections = M2_COLLECTIONS if collections is None else collections
-        for c in collections:
-            itemplate = template.replace("{c}", c)
-            ifiles = start.strftime(itemplate)
-            if not silent:
-                print(f"Reading {c}...")
-            ds = (
-                xr.open_mfdataset(ifiles)
-                .sel(lon=ilon, lat=ilat, method="nearest")
-                .sel(time=slice(start, end))
-                .load()
-            )
-            df = ds.to_dataframe().reset_index()
-            dfs.append(df)
-    
-    elif source in ["zarr", "s3"]:
-        SAVED_FILES_DIR = "GEOS_CF"
-        os.makedirs(SAVED_FILES_DIR, exist_ok=True)
-        location_name = f"loc_{ilat}_{ilon}".replace('.', '_').replace('-', 'm')
-        csv_path = os.path.join(SAVED_FILES_DIR, f"{location_name}.csv")
-    
-        force_full_download = False
-        if os.path.exists(csv_path):
-            if not silent:
-                print(f"Found existing CSV for {location_name}. Checking time coverage...")
-            df_existing = pd.read_csv(csv_path, parse_dates=["time"])
-            t_min = df_existing["time"].min().date()
-            base_start = datetime(2018, 1, 1).date()
-            if t_min <= base_start:
-                if not silent:
-                    print("CSV has historical data. Will only fetch forecast data.")
-                df_all = [df_existing]
-                try:
-                    ipath_fc = fsspec.get_mapper(S3_FORECASTS_TEMPLATE)
-                    ds_fc = xr.open_zarr(ipath_fc)
-                    df_fc = (
-                        ds_fc.sel(lon=ilon, lat=ilat, lev=1, method='nearest')
-                        .load()
-                        .to_dataframe()
-                        .reset_index()
-                    )
-                    df_fc["time"] = pd.to_datetime(df_fc["time"])
-                    df_all.append(df_fc)
-                except Exception as e:
-                    print(f"Error reading forecast data: {e}")
-                df_combined = pd.concat(df_all, ignore_index=True)
-                df_combined = df_combined.drop_duplicates(subset="time").sort_values("time")
-                df_combined.to_csv(csv_path, index=False)
-                if not silent:
-                    print(f" Updated CSV saved: {csv_path}")
-    
-                # --- S3 UPLOAD LOGIC START ---
-                s3_bucket_name = "smce-geos-cf-forecasts-oss-shared"
-                s3_key = f"snwg_forecast_working_files/GEOS_CF/{location_name}.csv"
-                s3_client = boto3.client("s3")
-                try:
-                    # Check S3 access
-                    s3_client.list_objects_v2(Bucket=s3_bucket_name, Prefix="snwg_forecast_working_files/GEOS_CF/", MaxKeys=1)
-                    if os.path.exists(csv_path):
-                        s3_client.upload_file(csv_path, s3_bucket_name, s3_key)
-                        print(f"CSV uploaded to s3://{s3_bucket_name}/{s3_key}")
-                    else:
-                        print(f"Local CSV {csv_path} does not exist, skipping S3 upload.")
-                except ClientError as e:
-                    print(f"S3 access/upload failed: {e}")
-                # --- S3 UPLOAD LOGIC END ---
-    
-                df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
-                dfs.append(df_filtered)
-            else:
-                if not silent:
-                    print("CSV does not contain full history. Will fetch full data.")
-                force_full_download = True
-        else:
-            if not silent:
-                print(" No CSV found. Will fetch full data.")
-            force_full_download = True
-    
-        if force_full_download:
-            df_all = []
-            sources = {
-                "historical": S3_TEMPLATE,
-                "replay": S3_REPLAY_TEMPLATE,
-                "forecast": S3_FORECASTS_TEMPLATE,
-            }
-            for label, tmpl in sources.items():
-                if not silent:
-                    print(f"Reading {label} data from {tmpl}...")
-                try:
-                    ipath = fsspec.get_mapper(tmpl)
-                    ds = (
-                        xr.open_zarr(ipath)
-                        .sel(lon=ilon, lat=ilat, lev=1, method='nearest')
-                        .load()
-                    )
-                    df = ds.to_dataframe().reset_index()
-                    df["time"] = pd.to_datetime(df["time"])
-                    df_all.append(df)
-                except Exception as e:
-                    print(f"Error reading {label}: {e}")
-            if df_all:
-                df_combined = pd.concat(df_all, ignore_index=True)
-                df_combined = df_combined.drop_duplicates(subset="time").sort_values("time")
-                df_combined.to_csv(csv_path, index=False)
-                if not silent:
-                    print(f" Full dataset saved to {csv_path}")
-    
-                # --- S3 UPLOAD LOGIC START ---
-                s3_bucket_name = "smce-geos-cf-forecasts-oss-shared"
-                s3_key = f"snwg_forecast_working_files/GEOS_CF/{location_name}.csv"
-                s3_client = boto3.client("s3")
-                try:
-                    s3_client.list_objects_v2(Bucket=s3_bucket_name, Prefix="snwg_forecast_working_files/GEOS_CF/", MaxKeys=1)
-                    if os.path.exists(csv_path):
-                        s3_client.upload_file(csv_path, s3_bucket_name, s3_key)
-                        print(f"CSV uploaded to s3://{s3_bucket_name}/{s3_key}")
-                    else:
-                        print(f"Local CSV {csv_path} does not exist, skipping S3 upload.")
-                except ClientError as e:
-                    print(f"S3 access/upload failed: {e}")
-                # --- S3 UPLOAD LOGIC END ---
-    
-                df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
-                dfs.append(df_filtered)
-            else:
-                if not silent:
-                    print("No data could be fetched.")
-
-    elif source == "local":
-        url = kwargs.get("url")
-        if not silent:
-            print(f"Reading csv file: {url}")
-        df = pd.read_csv(url)
-        df["time"] = pd.to_datetime(df["time"])
-        ids = df[(df["time"] >= start) & (df["time"] <= end)]
-        if not ids.empty:
-            dfs.append(ids)
-
-    elif source == "pandora":
-        url = kwargs.get("url")
-        if not silent:
-            print(f"Reading csv file: {url}")
-        df = pd.read_csv(url)
-        df["time"] = pd.to_datetime(df["date"])
-        df = df.drop(columns=['date'])
-        ids = df[(df["time"] >= start) & (df["time"] <= end)]
-        if not ids.empty:
-            dfs.append(ids)
-
-    # Combine all dataframes
-    if dfs:
-        mod = pd.concat(dfs, ignore_index=True)
+    if df_replay is not None:
+        dfs.append(df_replay)
+        start_index = 2 if version == 2 else 1  # Skip replay (and replay_cols for V2)
+        if verbose:
+            print(f"Skipping replay data fetch, only fetching recent data...")
     else:
-        mod = pd.DataFrame()
-
-    if not mod.empty:
-        mod["time"] = pd.to_datetime(mod["time"])
-        mod["month"] = mod["time"].dt.month
-        mod["hour"] = mod["time"].dt.hour
-        mod["weekday"] = mod["time"].dt.weekday
-
-        if resample is not None:
-            mod = mod.set_index("time").resample(resample).mean().reset_index()
-            if not silent:
-                print(f"Resampled model data to: {resample}")
-
-        for g in gases:
-            if g in mod.columns:
-                if not silent:
-                    print(f"Convert from v/v to ppbv: {g}")
-                mod[g] = mod[g] * VVtoPPBV
-
-    return mod
+        start_index = 0
+    
+    for i, path in enumerate(paths):
+        # Skip replay bucket
+        if i < start_index:
+            continue
+        
+        source_name = ["replay", "replay_cols", "forecast"][i] if version == 2 else ["replay", "analysis", "forecast"][i]
+        
+        if verbose:
+            print(f"Reading {source_name} from S3...")
+        
+        try:
+            ds = xr.open_zarr(fsspec.get_mapper(path), consolidated=True)
+            sel = {"lon": lon, "lat": lat, "method": "nearest"}
+            if "lev" in ds.dims or "lev" in ds.coords:
+                sel["lev"] = 1
+            df = ds.sel(**sel).load().to_dataframe().reset_index()
+            df["time"] = pd.to_datetime(df["time"])
+            
+            if verbose:
+                print(f"Read {len(df)} rows from {source_name}")
+            
+            # V2: merge replay and replay_cols horizontally
+            if version == 2 and i == 1 and dfs and df_replay is None:
+                # Only do horizontal merge if we're reading both replay sources
+                dfs[0] = pd.merge(dfs[0], df, on="time", how="outer", suffixes=("", "_x"))
+                dfs[0] = dfs[0][[c for c in dfs[0].columns if not c.endswith("_x")]]
+                continue
+            
+            dfs.append(df)
+        except Exception as e:
+            if verbose:
+                print(f"Error reading {source_name}: {e}")
+    
+    if not dfs:
+        if verbose:
+            print("[ERROR] No data could be retrieved")
+        return pd.DataFrame()
+    
+    # Merge vertical
+    if verbose:
+        print(f"Combining {len(dfs)} data sources...")
+    
+    df = pd.concat(dfs, ignore_index=True).sort_values("time").drop_duplicates("time", keep="first").reset_index(drop=True)
+    
+    # Save replay data to cache
+    if use_cache and df_replay is None:
+        try:
+            # V1: save replay only
+            # V2: save replay + replay_cols merged 
+            if version == 1:
+                # V2 Replay 
+                replay_times = df[df['time'] <= (datetime.now() - pd.Timedelta(days=30))]
+            else:
+                # V2, replay+cols
+                replay_times = df[df['time'] <= (datetime.now() - pd.Timedelta(days=5))]
+            
+            if len(replay_times) > 0:
+                replay_times.to_csv(cache_file, index=False)
+                if verbose:
+                    print(f"Saved {len(replay_times)} replay rows to {cache_file}")
+        except Exception as e:
+            if verbose:
+                print(f"Warning: Could not save cache file: {e}")
+    
+    # Harmonization
+    df = df.rename(columns={"t10m": "t", "u10m": "u", "v10m": "v", "pm25_rh35_gcc": "pm25_rh35"})
+    
+    # Derived AOD
+    if "aod550_sala" in df.columns and "aod550_salc" in df.columns:
+        df["aod550_ss"] = df["aod550_sala"] + df["aod550_salc"]
+    
+    # Filter dates
+    if start:
+        df = df[df["time"] >= start]
+    if end:
+        df = df[df["time"] <= end]
+    
+    # Convert to ppbv
+    for sp in DEFAULT_GASES + ["so2"]:  # Add so2 to the DEFAULT_GASES list
+        if sp in df.columns:
+            df[sp] *= VVtoPPBV
+    
+    # Add time features
+    df["month"] = df["time"].dt.month
+    df["hour"] = df["time"].dt.hour
+    df["weekday"] = df["time"].dt.weekday
+    
+    if verbose:
+        print(f"Retrieved {len(df)} total rows from {df['time'].min()} to {df['time'].max()}")
+    
+    return df.reset_index(drop=True)
