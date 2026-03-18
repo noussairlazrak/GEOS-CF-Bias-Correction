@@ -52,7 +52,9 @@ s3_prefixes = [
 ]
 s3_bucket_public = "smce-geos-cf-public"
 s3_prefixes_public = [
-    "snwg_forecast_working_files/precomputed/all_dts/"
+    "snwg_forecast_working_files/precomputed/all_dts/",
+    "snwg_forecast_working_files/precomputed/hourly_forecasts/",
+    "snwg_forecast_working_files/precomputed/pmtiles_output/"
 ]
 
 # Check S3 connectivity for all required prefixes
