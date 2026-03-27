@@ -1,0 +1,24 @@
+# run-job.sh
+# ----
+#!/usr/bin/env bash
+
+# Debugging container image
+if [ -n "${ECS_CONTAINER_METADATA_URI_V4-}" ]; then
+  python - <<'PY'
+import json
+import os
+import urllib.request
+
+url = os.environ["ECS_CONTAINER_METADATA_URI_V4"]
+with urllib.request.urlopen(url) as resp:
+    data = json.load(resp)
+
+print(f"container_image={data.get('Image', '')}")
+print(f"container_image_id={data.get('ImageID', '')}")
+print(f"container_name={data.get('Name', '')}")
+print(f"docker_id={data.get('DockerId', '')}")
+PY
+Fi
+
+# Run the actual command
+uv run python -u compress.py
