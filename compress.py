@@ -197,7 +197,7 @@ def generate_all_hourly_snapshots():
                 # Upload to S3
                 try:
                     s3_client = boto3.client("s3")
-                    if not funcs.upload_to_s3(str(filepath), s3_client, S3_BUCKET):
+                    if not funcs.upload_to_s3(str(filepath), s3_client, S3_BUCKET, S3_PREFIXES[0]):
                         print(f"Warning: Upload may have failed for {filename}")
                 except Exception as e:
                     print(f"Warning: Could not upload {filename} to S3: {e}")
@@ -274,7 +274,7 @@ if __name__ == '__main__':
             
             for tiff_file in tiff_files:
                 try:
-                    if funcs.upload_to_s3(str(tiff_file), s3_client, S3_BUCKET):
+                    if funcs.upload_to_s3(str(tiff_file), s3_client, S3_BUCKET, S3_PREFIXES[1]):
                         uploaded_count += 1
                 except Exception as e:
                     print(f"Warning: Failed to upload {tiff_file.name}: {e}")
