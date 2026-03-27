@@ -726,7 +726,6 @@ def openaq_hourly_avgs(sensor_ids, start_date, end_date, silent=False, data_dir=
             else:
                 combined_df = existing_df
 
-            # Check if this sensor's data is empty
             if combined_df.empty:
                 if not silent:
                     print(f"Sensor {sid} has no data.")
@@ -995,7 +994,7 @@ def check_s3_connectivity(bucket, prefixes):
     for prefix in prefixes:
         check_s3_access(bucket, prefix)
 
-def upload_to_s3(file_path, s3_client, s3_bucket):
+def upload_to_s3(file_path, s3_client, s3_bucket, s3_key):
     """Upload file to S3 bucket with verification.
     
     Parameters
@@ -1018,11 +1017,11 @@ def upload_to_s3(file_path, s3_client, s3_bucket):
             return False
         
         s3_bucket_name = s3_bucket.replace("s3://", "")
-        s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{os.path.basename(file_path)}"
+        s3_key = f"{s3_key}/{os.path.basename(file_path)}"
         
         try:
             s3_client.upload_file(file_path, s3_bucket_name, s3_key)
-            print(f"Successfully uploaded to s3://{s3_bucket_name}/{s3_key}")
+            print(f"Successfully uploaded to {s3_bucket_name}")
             return True
         except (OSError, IOError) as e:
             print(f"File read error uploading {file_path}: {e}")
@@ -1034,80 +1033,8 @@ def upload_to_s3(file_path, s3_client, s3_bucket):
         print(f"Unexpected error in upload_to_s3: {e}")
         return False
 
-def write_to_s3(data, s3_client, bucket, s3_key, data_format='json'):
-    """
-    Save data directly to S3 without creating local files.
-    
-    Parameters
-    ----------
-    data : dict or DataFrame
-        Data to save
-    s3_client : boto3.client
-        S3 client instance
-    bucket : str
-        S3 bucket name (without s3:// prefix)
-    s3_key : str
-        S3 key (path within bucket)
-    data_format : str
-        Format to save ('json' or 'csv')
-    """
-    try:
-        bucket_name = bucket.replace("s3://", "")
-        
-        if data_format == 'json':
-            import json
-            json_data = json.dumps(data, default=str, indent=2)
-            s3_client.put_object(Bucket=bucket_name, Key=s3_key, Body=json_data)
-        elif data_format == 'csv':
-            csv_buffer = data.to_csv(index=False)
-            s3_client.put_object(Bucket=bucket_name, Key=s3_key, Body=csv_buffer)
-        
-        print(f"Data saved directly to s3://{bucket_name}/{s3_key}")
-        return True
-    except Exception as e:
-        print(f"Failed to save to S3: {e}")
-        return False
 
-def save_model_csv_to_s3(df, s3_client, bucket_name, s3_prefix, location_name):
-    """Save model DataFrame to S3 as CSV.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Model data to save
-    s3_client : boto3.client
-        S3 client
-    bucket_name : str
-        S3 bucket name (without s3:// prefix)
-    s3_prefix : str
-        S3 prefix/folder (e.g., "snwg_forecast_working_files/GEOS_CF/")
-    location_name : str
-        Location identifier for the filename
-        
-    Returns
-    -------
-    bool
-        True if successful, False otherwise
-    """
-    try:
-        s3_key = f"{s3_prefix}{location_name}.csv"
-        csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False)
-        csv_buffer.seek(0)
-        
-        s3_client.put_object(
-            Bucket=bucket_name,
-            Key=s3_key,
-            Body=csv_buffer.getvalue()
-        )
-        print(f"✓ Model CSV saved to s3://{bucket_name}/{s3_key}")
-        return True
-    except Exception as e:
-        print(f"✗ Failed to save model CSV to S3: {e}")
-        return False
-
-
-def read_model_csv_from_s3(s3_client, bucket_name, s3_prefix, location_name):
+def read_s3_file(s3_client, bucket_name, s3_prefix, location_name):
     """Read model DataFrame from S3.
     
     Parameters
@@ -1130,21 +1057,20 @@ def read_model_csv_from_s3(s3_client, bucket_name, s3_prefix, location_name):
         s3_key = f"{s3_prefix}{location_name}.csv"
         response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
         df = pd.read_csv(response['Body'], parse_dates=['time'])
-        print(f"✓ Model CSV loaded from s3://{bucket_name}/{s3_key}")
+        print(f"Model CSV loaded from s3://{bucket_name}/{s3_key}")
         return df
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
-            # File doesn't exist yet, which is normal
             return None
         else:
-            print(f"✗ Error reading model CSV from S3: {e}")
+            print(f"Error reading model CSV from S3: {e}")
             return None
     except Exception as e:
-        print(f"✗ Error reading model CSV from S3: {e}")
+        print(f"Error reading model CSV from S3: {e}")
         return None
 
 
-def check_model_csv_exists_s3(s3_client, bucket_name, s3_prefix, location_name):
+def check_s3_file_status(s3_client, bucket_name, s3_prefix, location_name):
     """Check if model CSV exists in S3.
     
     Parameters
@@ -1175,45 +1101,8 @@ def check_model_csv_exists_s3(s3_client, bucket_name, s3_prefix, location_name):
     except Exception:
         return False
     
-    
-def upload_model_to_s3(model, loc, spec, s3_client=None):
-    """Uploads a trained model to S3 and verifies upload."""
-    if s3_client is None:
-        print("No s3_client provided, skipping model upload.")
-        return
-    model_path = f"lgbm_{loc}_{spec}.joblib"
-    joblib.dump(model, model_path)
-    s3_bucket = "smce-geos-cf-forecasts-oss-shared"
-    s3_key = f"snwg_forecast_working_files/MODELS/{model_path}"
-    try:
-        s3_client.upload_file(model_path, s3_bucket, s3_key)
-        print(f"Model uploaded to s3://{s3_bucket}/{s3_key}")
-        # Verify upload
-        response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)
-        found = any(obj['Key'] == s3_key for obj in response.get('Contents', []))
-        if found:
-            print("S3 upload verified.")
-        else:
-            print("Warning: Model upload to S3 could not be verified.")
-    except Exception as s3e:
-        print(f"[ERROR] Model upload to S3 failed: {s3e}")
-    finally:
-        if os.path.exists(model_path):
-            os.remove(model_path)
             
-def gen_plot(
-    df,
-    clmn_grps,
-    clrs,
-    stls,
-    ttl,
-    ylbls,
-    sv_pth=None,
-    lbl_rnm=None,
-    line_names=None,
-    resample='1D'
-):
-    # --- Resample time series if requested ---
+def gen_plot( df, clmn_grps, clrs, stls, ttl, ylbls, sv_pth=None, lbl_rnm=None, line_names=None, resample='1D' ):
     if resample:
         df = df.copy()
         df['time'] = pd.to_datetime(df['time'])
@@ -1234,7 +1123,6 @@ def gen_plot(
     for i, (clmns, ax) in enumerate(zip(clmn_grps, axs)):
         for j, (cl, clr, stl) in enumerate(zip(clmns, clrs[i], stls[i])):
 
-            # --- Resolve line label ---
             if line_names is not None:
                 lbl = line_names[i][j]
             elif lbl_rnm is not None:
