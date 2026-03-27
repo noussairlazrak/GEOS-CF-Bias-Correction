@@ -33,33 +33,25 @@ CLEAN_LOCAL = args.clean_local
 NO_LOCAL_SAVE = args.no_local_save
 SAVE_PLOTS_LOCAL = True
 UPLOAD_PLOTS_S3 = True
-FORECAST_HOURS_THRESHOLD = 1
-S3_PLOTS_PREFIX = "snwg_forecast_working_files/plots/"
+FORECAST_HOURS_THRESHOLD = 5
 
 # Model CSV cache configuration 
 # Use --model-cache local or --model-cache s3 to control
-s3_client = boto3.client("s3")
 MODEL_CACHE_SOURCE = args.model_cache  # "local" or "s3"
-S3_MODEL_CACHE_PREFIX = "snwg_forecast_working_files/GEOS_CF/"
 
 # S3 bucket and prefixes to check
-s3_bucket = "smce-geos-cf-forecasts-oss-shared"
+s3_client = boto3.client("s3")
+s3_bucket = "smce-geos-cf-public"
 s3_prefixes = [
     "snwg_forecast_working_files/GEOS_CF/",
     "snwg_forecast_working_files/OPENAQ/",
     "snwg_forecast_working_files/plots/",
-    "snwg_forecast_working_files/precomputed/all_dts/"
-]
-s3_bucket_public = "smce-geos-cf-public"
-s3_prefixes_public = [
     "snwg_forecast_working_files/precomputed/all_dts/",
-    "snwg_forecast_working_files/precomputed/hourly_forecasts/",
-    "snwg_forecast_working_files/precomputed/pmtiles_output/"
+    "snwg_forecast_working_files/MODELS/"
 ]
 
 # Check S3 connectivity for all required prefixes
 funcs.check_s3_connectivity(s3_bucket, s3_prefixes)
-funcs.check_s3_connectivity(s3_bucket_public, s3_prefixes_public)
 
 # Create local directories (skip if NO_LOCAL_SAVE)
 if not NO_LOCAL_SAVE:
@@ -83,7 +75,7 @@ all_locations = []
 force_update = True 
 #generting the forecasts routine
 for key, location_data in list(data.items()):
-    if location_data.get("observation_source") in ("DoS_Missions", "#NASA Pandora", "REMMAQ"):
+    if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "#REMMAQ"):
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
         lat = location_data["lat"]
@@ -112,7 +104,7 @@ for key, location_data in list(data.items()):
                 
                 if NO_LOCAL_SAVE:
                     # Save directly to S3 without local file
-                    s3_bucket_name = s3_bucket_public.replace("s3://", "")
+                    s3_bucket_name = s3_bucket.replace("s3://", "")
                     s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{site}.json"
                     if funcs.write_to_s3(merra2cnn, s3_client, s3_bucket_name, s3_key, data_format='json'):
                         print(f"PM2.5 forecast for {locname} uploaded to S3")
@@ -121,7 +113,7 @@ for key, location_data in list(data.items()):
                 else:
                     funcs.save_forecast_to_json(merra2cnn, metadata, site_settings=site_settings, species="pm25", sources=["merra2", "geoscf"], output_path=site_file_path)
                     # Upload to S3
-                    if funcs.upload_to_s3(site_file_path, s3_client, s3_bucket_public):
+                    if funcs.upload_to_s3(site_file_path, s3_client, s3_bucket, s3_prefixes[3]):
                         print(f"NO2 forecast for {locname} uploaded to S3")
                     
                     # Clean up local file if requested
@@ -216,10 +208,8 @@ for key, location_data in list(data.items()):
                     silent=site_settings['silent'],
                     force_retrain=True
                 )
-                # Upload model to S3
-                funcs.upload_model_to_s3(model, site_settings['l_name'], site_settings['species'], s3_client=s3_client)
                 if merged_data is None:
-                    print(f"[ERROR] Bias correction failed for {locname}")
+                    print(f"ERROR: Bias correction failed for {locname}")
                     continue
                 # Use merged_data 
                 forecasts_raw = merged_data
@@ -278,23 +268,6 @@ for key, location_data in list(data.items()):
                         )
                         print(f"Plot generated for {locname}")
                         
-                        # Upload to S3 
-                        if not NO_LOCAL_SAVE or CLEAN_LOCAL:
-                            try:
-                                s3_bucket_name = s3_bucket.replace("s3://", "")
-                                s3_key = os.path.join(S3_PLOTS_PREFIX, f"{locname}.png").replace("\\", "/")
-                                s3_client.upload_file(local_plot_path, s3_bucket_name, s3_key)
-                                print(f"Plot uploaded to s3://{s3_bucket_name}/{s3_key}")
-                            except Exception as upload_err:
-                                print(f"Failed to upload plot for {locname} to S3: {upload_err}")
-                        
-                        # Remove local
-                        if CLEAN_LOCAL or NO_LOCAL_SAVE:
-                            try:
-                                os.remove(local_plot_path)
-                                print(f"Local plot removed: {locname}.png")
-                            except Exception:
-                                pass
                     except Exception as plot_err:
                         print(f"Plot generation failed for {locname}: {plot_err}")
                         traceback.print_exc()
@@ -311,7 +284,7 @@ for key, location_data in list(data.items()):
 
                 if NO_LOCAL_SAVE:
                     # Save directly to S3
-                    s3_bucket_name = s3_bucket_public.replace("s3://", "")
+                    s3_bucket_name = s3_bucket.replace("s3://", "")
                     s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{locname}.json"
                     # Convert DataFrame
                     merg_dict = merg.to_dict(orient='records')
@@ -342,7 +315,7 @@ for key, location_data in list(data.items()):
                     except Exception as e:
                         print(f"Warning: Could not add metrics to local JSON for {locname}: {e}")
                     # Upload to S3
-                    if funcs.upload_to_s3(file_path, s3_client, s3_bucket_public):
+                    if funcs.upload_to_s3(file_path, s3_client, s3_bucket, s3_prefixes[3]):
                         print(f"no2 forecast for {locname} uploaded to S3")
                     if CLEAN_LOCAL:
                         try:
