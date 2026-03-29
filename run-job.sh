@@ -4,7 +4,7 @@
 
 # Debugging container image
 if [ -n "${ECS_CONTAINER_METADATA_URI_V4-}" ]; then
-  python - <<'PY'
+  uv run python - <<'PY'
 import json
 import os
 import urllib.request
