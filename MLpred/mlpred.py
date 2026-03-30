@@ -71,17 +71,17 @@ ZARR_TEMPLATE = [
     "geos-cf/zarr/geos-cf.chm_tavg_1hr_g1440x721_v1.zarr",
 ]
 ZARR_TEMPLATE = ["geos-cf/zarr/geos-cf-rpl.zarr"]
-S3_TEMPLATE = "s3://s3://smce-geos-cf-public/geos-cf-rpl.zarr/"
-S3_FORECASTS_TEMPLATE = "s3://s3://smce-geos-cf-public/geos-cf-fcst-latest.zarr/"
-S3_REPLAY_TEMPLATE = "s3://s3://smce-geos-cf-public/geos-cf-ana-latest.zarr"
+S3_TEMPLATE = "s3://smce-geos-cf-public/geos-cf-rpl.zarr/"
+S3_FORECASTS_TEMPLATE = "s3://smce-geos-cf-public/geos-cf-fcst-latest.zarr/"
+S3_REPLAY_TEMPLATE = "s3://smce-geos-cf-public/geos-cf-ana-latest.zarr"
 OPENDAP_TEMPLATE = "https://opendap.nccs.nasa.gov/dods/gmao/geos-cf/fcast/met_tavg_1hr_g1440x721_x1.latest"
 M2_TEMPLATE = "/home/ftei-dsw/Projects/SurfNO2/data/M2/{c}/small/*.{c}.%Y%m*.nc4"
 M2_COLLECTIONS = ["tavg1_2d_flx_Nx", "tavg1_2d_lfo_Nx", "tavg1_2d_slv_Nx"]
 OPENAQ_TEMPLATE = "https://api.openaq.org/v2//measurements?date_from={Y1}-{M1}-01T00%3A00%3A00%2B00%3A00&date_to={Y2}-{M2}-01T00%3A00%3A00%2B00%3A00&limit=10000&page=1&offset=0&sort=asc&radius=1000&location_id={ID}&parameter={PARA}&order_by=datetime"
 
-S3_V2_RPL = "s3://s3://smce-geos-cf-public/geos-cf-v2-rpl.zarr"
-S3_V2_COLS = "s3://s3://smce-geos-cf-public/geos-cf-v2-rpl-cols.zarr"
-S3_V2_FCST = "s3://s3://smce-geos-cf-public/geos-cf-v2-fcst-latest.zarr/"
+S3_V2_RPL = "s3://smce-geos-cf-public/geos-cf-v2-rpl.zarr"
+S3_V2_COLS = "s3://smce-geos-cf-public/geos-cf-v2-rpl-cols.zarr"
+S3_V2_FCST = "s3://smce-geos-cf-public/geos-cf-v2-fcst-latest.zarr/"
 
 
 OPENAQAPI = "ae1be41f0d6e6400a0ad67ccdb6bea912c7787a14038038d94dfc1b2044f7cd4"
@@ -1036,9 +1036,9 @@ class ObsSite:
                     print(f"Found existing CSV for {location_name}. Checking time coverage...")
                     df_existing = pd.read_csv(csv_path, parse_dates=["time"])
             else:  # S3
-                if funcs.check_model_csv_exists_s3(s3_client, s3_bucket, s3_prefix, location_name):
+                if funcs.check_s3_file_status(s3_client, s3_bucket, s3_prefix, location_name):
                     print(f"Found existing S3 CSV for {location_name}. Checking time coverage...")
-                    df_existing = funcs.read_model_csv_from_s3(s3_client, s3_bucket, s3_prefix, location_name)
+                    df_existing = funcs.read_s3_file(s3_client, s3_bucket, s3_prefix, location_name)
                 else:
                     df_existing = None
 
@@ -1074,7 +1074,7 @@ class ObsSite:
                         df_combined.to_csv(csv_path, index=False)
                         print(f"Updated CSV saved: {csv_path}")
                     else:  # S3
-                        funcs.save_model_csv_to_s3(df_combined, s3_client, s3_bucket, s3_prefix, location_name)
+                        funcs.upload_to_s3(csv_path, s3_client, s3_bucket, s3_key)
 
                     df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
                     dfs.append(df_combined)
@@ -1121,7 +1121,7 @@ class ObsSite:
                         df_combined.to_csv(csv_path, index=False)
                         print(f"Full dataset saved to {csv_path}")
                     else:  # S3
-                        funcs.save_model_csv_to_s3(df_combined, s3_client, s3_bucket, s3_prefix, location_name)
+                        funcs.upload_to_s3(csv_path, s3_client, s3_bucket, s3_key)
 
                     df_filtered = df_combined[(df_combined["time"] >= start) & (df_combined["time"] <= end)]
                     dfs.append(df_filtered)
@@ -1542,31 +1542,7 @@ class ObsSite:
             return to_plot
 
 
-def get_localised_forecast(
-    loc='',
-    spec='no2',
-    lat=0.0,
-    lon=0.0,
-    mod_src='s3',
-    obs_src='pandora',
-    openaq_id=None,
-    GEOS_CF=None,
-    OBS_URL=None,
-    st=None,
-    ed=None,
-    resamp='1h',
-    unit='ppb',
-    interpol=True,
-    rmv_out=True,
-    time_col='time',
-    date_fmt='%Y-%m-%d %H:%M',
-    obs_val_col='unit',
-    lat_col=None,
-    lon_col=None,
-    silent=False,
-    force_retrain=True,
-    **kwargs
-):
+def get_localised_forecast( loc='', spec='no2', lat=0.0, lon=0.0, mod_src='s3', obs_src='pandora', openaq_id=None, GEOS_CF=None, OBS_URL=None, st=None, ed=None, resamp='1h', unit='ppb', interpol=True, rmv_out=True, time_col='time', date_fmt='%Y-%m-%d %H:%M', obs_val_col='unit', lat_col=None, lon_col=None, silent=False, force_retrain=True, **kwargs ):
     """
     Generate localized air quality forecasts using GEOS-CF model data and observations.
     
@@ -1650,10 +1626,10 @@ def get_localised_forecast(
             print(f"V1 data: {len(df_v1)} rows ({df_v1['time'].min()} to {df_v1['time'].max()})")
             print(f"V2 data: {len(df_v2)} rows ({df_v2['time'].min()} to {df_v2['time'].max()})")
         
-        # Combine into one consistent dataframe (V2 is continuation of V1)
+        # Combine 
         site._mod = pd.concat([df_v1, df_v2], ignore_index=True).drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
         
-        # Extract forecast portion (future dates only)
+        # Extract 
         now = datetime.now()
         pred_dt = site._mod[site._mod['time'] >= now - timedelta(hours=1)].copy()
         
@@ -2174,17 +2150,7 @@ def get_localised_forecast(
 
 
 ## General Functions
-def read_openaq(
-    sensor_id,
-    start,
-    end,
-    parameter='o3',
-    silent=False,
-    remove_outlier=0,
-    api_key=OPENAQAPI,
-    chunk_days=30,
-    **kwargs
-):
+def read_openaq(sensor_id,start,end,parameter='o3',silent=False,remove_outlier=0,api_key=OPENAQAPI,chunk_days=30,**kwargs):
 
     base_url = f"https://api.openaq.org/v3/sensors/{sensor_id}/measurements"
     
@@ -2284,24 +2250,7 @@ def read_openaq(
             print(f"Warning: An error occurred while processing the data - {str(e)}")
         return None
 
-def read_local_obs(
-    obs_url=None,
-    time_col="Time",
-    date_format="%m/%d/%Y %H:%M:%S",
-    value_collum= None,
-    lat_col=None,
-    lon_col=None,
-    species=None,
-    silent=True,
-    start = None,
-    end = None,
-    remove_outlier=False,
-    rename_column=None,
-    unit=None,
-    lat=None,
-    lon=None,
-    **kwargs,
-):
+def read_local_obs( obs_url=None, time_col="Time", date_format="%m/%d/%Y %H:%M:%S", value_collum= None, lat_col=None, lon_col=None, species=None, silent=True, start = None, end = None, remove_outlier=False, rename_column=None, unit=None, lat=None, lon=None, **kwargs, ):
 
     col_name = rename_column if rename_column else "value"
 
@@ -2653,25 +2602,7 @@ def convert_no2_mol_m3_to_ppbv(no2_mol_m3, temperature_k, pressure_mbar):
     pressure_atm = pressure_mbar / 1013.25
     return no2_mol_m3 * (24.45 * 1e9) / (0.0821 * temperature_k * pressure_atm)
 
-def read_validation_set(
-    openaq_id=None,
-    source=None,
-    name=None,
-    url=None,
-    time_col=None,
-    date_format=None,
-    obs_val_col=None,
-    lat_col=None,
-    lon_col=None,
-    species=None,
-    lat=999,
-    lon=-999,
-    unit=None,
-    start=None,
-    end=None,
-    remove_outlier = None,
-    **kwargs,
-):
+def read_validation_set( openaq_id=None, source=None, name=None, url=None, time_col=None, date_format=None, obs_val_col=None, lat_col=None, lon_col=None, species=None, lat=999, lon=-999, unit=None, start=None, end=None, remove_outlier = None, **kwargs, ):
 
     all_obs = pd.DataFrame()
     isite = ObsSite(
@@ -2801,67 +2732,6 @@ def merge_intervales_with_model(self, confidenceIntervals):
     all_intervals = all_intervals.merge(xg_preditions)
     all_intervals = all_intervals.set_index("time").resample("1D").mean()
     return all_intervals
-
-
-def location_plot(dataframe=None, location_name=None, title="Location x (lat, lon)", species="no2", unit="ppbv", model_info="", resample=None, directory="plots/"):
-    """General plotting routine for all the forecasts with different observation sources"""
-
-    location_name_cor = re.sub("[^0-9a-zA-Z]+", "_", location_name)
-    dataframe["time"] = pd.to_datetime(dataframe["time"])
-    final_df = dataframe.copy()
-    fvar = "pm25_rh35_gcc" if species == "pm25" else species
-
-    rows = 3 if any(col in final_df.columns for col in ["pandora_height", "zpbl"]) else 1
-    
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.05)
-
-    x = final_df["time"]
-
-    unit_display = "ug/m3" if unit == "ugm3" else unit
-
-
-    if "no2" in final_df.columns:
-        fig.add_trace(go.Scatter(x=x, y=final_df["no2"], mode='lines', name="GEOS-CF Model",
-                                 line=dict(color="gray", width=2, dash='dash')), row=1, col=1)
-        
-    if "o3" in final_df.columns:
-        fig.add_trace(go.Scatter(x=x, y=final_df["o3"], mode='lines', name="GEOS-CF Model",
-                                 line=dict(color="gray", width=2, dash='dash')), row=1, col=1)
-
-    if "pandora" in final_df.columns:
-        fig.add_trace(go.Scatter(x=x, y=final_df["pandora"], mode='lines', name="Pandora Surface",
-                                 line=dict(color="black", width=2)), row=1, col=1)
-        
-    if "hybrid" in final_df.columns:
-        fig.add_trace(go.Scatter(x=x, y=final_df["hybrid"], mode='lines', name="Pandora Hybrid o3",
-                                 line=dict(color="black", width=2)), row=1, col=1)
-
-    if "corrected_pandora" in final_df.columns:
-        fig.add_trace(go.Scatter(x=x, y=final_df["corrected_pandora"], mode='lines', name="Model + ML",
-                                 line=dict(color="red", width=2)), row=1, col=1)
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="Date",
-        yaxis_title=f"{species} ({unit_display})",
-        width=850,
-        height=400,
-        legend_title="Legend",
-        xaxis_tickangle=-45,
-        margin=dict(l=50, r=50, t=50, b=50),
-        plot_bgcolor='white'
-        
-    )
-
-    fig.update_xaxes(tickangle=-45)
-    fig.update_yaxes(ticksuffix=" ppbv")
-
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
-    fig.write_image(f"{directory}{location_name_cor}_{species}.svg", width=1600, height=600)
-
-    return fig
 
 def resample_selected_columns(df, timecol, clmn_grps, resample_freq='1D'):
 
@@ -3305,94 +3175,6 @@ def get_location_info(url, location_code):
         return None
     
     
-def plot_locations_map(locations, title='Location Map', output_path='locations_map', directory='pandora_cf/plots'):
-    """
-    Create map plot of locations with markers.
-    
-    Args:
-        locations (list): List of dictionaries with location details
-        title (str): Map title
-        output_path (str): Base filename for output files
-    
-    Returns:
-        plotly.graph_objs.Figure: Plotly figure object
-    """
-    # Validate input
-    if not locations or not isinstance(locations, list):
-        print("Invalid locations data")
-        return None
-
-    # Ensure output directory exists
-    os.makedirs(directory, exist_ok=True)
-
-    location_df = pd.DataFrame(locations)
-    
-    if 'lat' in location_df.columns and 'lon' in location_df.columns:
-        center_lat = location_df['lat'].mean()
-        center_lon = location_df['lon'].mean()
-        print(f"Center Latitude: {center_lat}, Center Longitude: {center_lon}")
-        center_lat = location_df['lat'].mean()
-        center_lon = location_df['lon'].mean()
-
-
-        colors = ['blue' if loc['type'] == 'OpenAQ' else 'red' for loc in locations]
-
-
-
-        fig = go.Figure(go.Scattermapbox(
-            mode='markers+text',
-            lon=location_df['lon'],
-            lat=location_df['lat'],
-            marker=dict(
-                size=10,
-                color=colors,
-                opacity=0.7
-            ),
-            text=location_df['name'],
-            textposition='bottom center',
-            hoverinfo='text',
-            hovertext=[
-                f"Name: {row['name']}<br>Type: {row.get('type', 'N/A')}" 
-                for _, row in location_df.iterrows()
-            ]
-        ))
-
-        fig.update_layout(
-            title=title,
-            mapbox=dict(
-                style='open-street-map',
-                center=dict(
-                    lat=center_lat,
-                    lon=center_lon
-                ),
-                zoom=5
-            ),
-            showlegend=False,
-            height=800,
-            width=1200
-        )
-
-        lat_range = location_df['lat'].max() - location_df['lat'].min()
-        lon_range = location_df['lon'].max() - location_df['lon'].min()
-
-        zoom_lat = max(2, min(10, 10 - lat_range))
-        zoom_lon = max(2, min(10, 10 - lon_range))
-
-        fig.update_layout(
-            mapbox=dict(zoom=min(zoom_lat, zoom_lon))
-        )
-
-        try:
-            fig.write_image(f'{directory}/{output_path}.png', scale=2)
-            fig.write_image(f'{directory}/{output_path}.svg')
-        except Exception as e:
-            print(f"Error saving map: {e}")
-        
-        return fig
-    else:
-        print("Latitude or Longitude column missing.")
-
-
 
 def get_no2_locations(lat, lon, radius_km):
 
@@ -3633,101 +3415,6 @@ def process_location_data(code=None):
         })
 
     return locations
-    
-    
-    
-def xgboost_bias_correction(merged_data):
-    """
-    Perform XGBoost bias correction for NO2 concentrations
-    
-    Args:
-        merged_data (pd.DataFrame): Merged dataset with model and observation data
-    
-    Returns:
-        pd.DataFrame: Original data with corrected predictions added
-    """
-
-    features = [
-      
-       'no2_surface_conc_mol_m3', 'no2_surface_conc_uncertainty',
-       'no2_surface_conc_index', 'no2_heterogeneity_flag',
-       'no2_stratospheric_column', 'no2_tropospheric_column',
-       'no2_layer1_height_km', 'pressure_mbar', 'temperature_k',
-       'solar_zenith_angle', 'quality_flag_no2', 'integration_time_ms',
-       'wavelength_shift_nm'
-    ]
-    
-    print(merged_data.columns)
-    available_features = [f for f in features if f in merged_data.columns]
-
-    target_columns = ['pandora']
-    
-    valid_targets = [col for col in target_columns if col in merged_data.columns]
-    
-    if not valid_targets:
-        print("No valid target columns found for bias correction")
-        return merged_data
-    
-    for target in valid_targets:
-        try:
-            X = merged_data[available_features].copy()
-            y = merged_data[target].copy()
-            
-
-            valid_mask = ~(X.isna().any(axis=1) | y.isna())
-            X_clean = X[valid_mask]
-            y_clean = y[valid_mask]
-            
-
-            if len(X_clean) < 10:
-                print(f"Insufficient data for {target} bias correction")
-                continue
-            
-
-            selector = SelectKBest(score_func=f_regression, k=min(20, len(available_features)))
-            X_selected = selector.fit_transform(X_clean, y_clean)
-            selected_features = X_clean.columns[selector.get_support()]
-            
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X_clean[selected_features])
-            
- 
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_scaled, y_clean, test_size=0.3, random_state=7
-            )
-            
-
-            xgb_model = xgb.XGBRegressor(colsample_bytree=0.3,learning_rate=0.01,max_depth=10,n_estimators=1000,verbosity=0)
-            
-            xgb_model.fit(X_train, y_train)
-            
-
-            X_full_scaled = scaler.transform(X[selected_features])
-            corrected_predictions = xgb_model.predict(X_full_scaled)
-            
-
-            corrected_series = pd.Series(np.nan, index=merged_data.index)
-            corrected_series[valid_mask] = corrected_predictions
-
-            merged_data[f'corrected_{target}'] = corrected_series
-            
-
-            y_pred = xgb_model.predict(X_test)
-            print(f"{target} Bias Correction Metrics:")
-            print(f"R2 Score: {r2_score(y_test, y_pred):.4f}")
-            print(f"MSE: {mean_squared_error(y_test, y_pred):.4f}")
-            
-            merged_data[f'R2'] = r2_score(y_test, y_pred)
-            merged_data[f'MSE'] = mean_squared_error(y_test, y_pred)
-        
-        except Exception as e:
-            print(f"Error in bias correction for {target}: {e}")
-
-            print("X_clean shape:", X_clean.shape)
-            print("y_clean shape:", y_clean.shape)
-            print("corrected_predictions shape:", corrected_predictions.shape)
-            print("valid_mask shape:", valid_mask.shape)
-    return merged_data
 
 
 def get_openaq_locations(api_key=OPENAQAPI, lat=None, lon=None, radius=None, parameter=None, max_retries=5, base_delay=1):

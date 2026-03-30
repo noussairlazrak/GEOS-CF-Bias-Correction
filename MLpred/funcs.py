@@ -1021,7 +1021,7 @@ def upload_to_s3(file_path, s3_client, s3_bucket, s3_key):
         
         try:
             s3_client.upload_file(file_path, s3_bucket_name, s3_key)
-            print(f"Successfully uploaded to {s3_bucket_name}")
+            print(f"Successfully uploaded to {s3_bucket_name}/{s3_key}")
             return True
         except (OSError, IOError) as e:
             print(f"File read error uploading {file_path}: {e}")

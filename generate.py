@@ -43,11 +43,11 @@ MODEL_CACHE_SOURCE = args.model_cache  # "local" or "s3"
 s3_client = boto3.client("s3")
 s3_bucket = "smce-geos-cf-public"
 s3_prefixes = [
-    "snwg_forecast_working_files/GEOS_CF/",
-    "snwg_forecast_working_files/OPENAQ/",
-    "snwg_forecast_working_files/plots/",
-    "snwg_forecast_working_files/precomputed/all_dts/",
-    "snwg_forecast_working_files/MODELS/"
+    "snwg_forecast_working_files/GEOS_CF",
+    "snwg_forecast_working_files/OPENAQ",
+    "snwg_forecast_working_files/plots",
+    "snwg_forecast_working_files/precomputed/all_dts",
+    "snwg_forecast_working_files/MODELS"
 ]
 
 # Check S3 connectivity for all required prefixes
