@@ -37,8 +37,8 @@ from MLpred import funcs
 # S3 configuration
 S3_BUCKET = "smce-geos-cf-public"
 S3_PREFIXES = [
-    "snwg_forecast_working_files/precomputed/hourly_forecasts/",
-    "snwg_forecast_working_files/precomputed/pmtiles_output/"
+    "snwg_forecast_working_files/precomputed/hourly_forecasts",
+    "snwg_forecast_working_files/precomputed/pmtiles_output"
 ]
 
 def get_forecast_for_hour(site_data, site_name, target_utc, site_index_entry=None):
