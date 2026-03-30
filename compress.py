@@ -35,7 +35,7 @@ sys.path.insert(1, 'MLpred')
 from MLpred import funcs
 
 # S3 configuration
-S3_BUCKET = "smce-geos-cf-forecasts-oss-shared"
+S3_BUCKET = "smce-geos-cf-public"
 S3_PREFIXES = [
     "snwg_forecast_working_files/precomputed/hourly_forecasts/",
     "snwg_forecast_working_files/precomputed/pmtiles_output/"
