@@ -17,6 +17,9 @@ print(f"container_image={data.get('Image', '')}")
 print(f"container_image_id={data.get('ImageID', '')}")
 print(f"container_name={data.get('Name', '')}")
 print(f"docker_id={data.get('DockerId', '')}")
+
+import rasterio
+
 PY
 fi
 
