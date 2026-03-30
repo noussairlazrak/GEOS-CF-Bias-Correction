@@ -4,7 +4,7 @@
 
 # Debugging container image
 if [ -n "${ECS_CONTAINER_METADATA_URI_V4-}" ]; then
-  python - <<'PY'
+  uv run python - <<'PY'
 import json
 import os
 import urllib.request
@@ -17,6 +17,9 @@ print(f"container_image={data.get('Image', '')}")
 print(f"container_image_id={data.get('ImageID', '')}")
 print(f"container_name={data.get('Name', '')}")
 print(f"docker_id={data.get('DockerId', '')}")
+
+import rasterio
+
 PY
 fi
 
