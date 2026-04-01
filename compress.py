@@ -137,7 +137,7 @@ def generate_all_hourly_snapshots():
             print(f"Loaded {len(sites_index_list)} site entries from sites_index.json\n")
         else:
             print(f"Warning: sites_index.json not found locally, proceeding with version from {url_sites_index}.")
-            sites_index_list = json.load(requests.get(url_sites_index, stream=True).text)
+            sites_index_list = json.loads(requests.get(url_sites_index, stream=True).text)
             print(f"Loaded {len(sites_index_list)} site entries from {url_sites_index}\n")
     except Exception as e:
         print(f"ERROR: Failed to load sites_index.json: {e}")
