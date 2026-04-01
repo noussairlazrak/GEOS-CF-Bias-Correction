@@ -17,6 +17,7 @@ Output:
 import json
 import os
 import sys
+import requests
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -40,6 +41,9 @@ S3_PREFIXES = [
     "snwg_forecast_working_files/precomputed/hourly_forecasts",
     "snwg_forecast_working_files/precomputed/pmtiles_output"
 ]
+
+# access to the sites_index.json file
+url_sites_index =  "https://raw.githubusercontent.com/GEOS-ESM/SNWG_Localized_Forecasts/refs/heads/pandora/precomputed/sites_index.json"
 
 def get_forecast_for_hour(site_data, site_name, target_utc, site_index_entry=None):
     """Get forecast for a specific hour from site data"""
@@ -127,14 +131,13 @@ def generate_all_hourly_snapshots():
     
     sites_index_list = []
     try:
-        if os.path.exists('precomputed/sites_index.json'):
-            with open('precomputed/sites_index.json', 'r') as f:
-                sites_index_list = json.load(f)
-            print(f"Loaded {len(sites_index_list)} site entries from sites_index.json\n")
-        else:
-            print("Warning: sites_index.json not found, proceeding without it.")
+        print(f"Fetching sites_index.json from {url_sites_index}...")
+        response = requests.get(url_sites_index, timeout=30)
+        response.raise_for_status()
+        sites_index_list = response.json()
+        print(f"Loaded {len(sites_index_list)} site entries from {url_sites_index}\n")
     except Exception as e:
-        print(f"ERROR: Failed to load sites_index.json: {e}")
+        print(f"ERROR: Failed to load sites_index.json from URL: {e}")
     
     site_files = glob.glob('precomputed/all_dts/*.json')
     sites_data = {}
@@ -289,4 +292,3 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Warning: GeoTIFF generation failed: {e}", file=sys.stderr)
         print("Hourly forecasts still saved successfully.")
-
