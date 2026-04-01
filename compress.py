@@ -131,13 +131,16 @@ def generate_all_hourly_snapshots():
     
     sites_index_list = []
     try:
-        print(f"Fetching sites_index.json from {url_sites_index}...")
-        response = requests.get(url_sites_index, timeout=30)
-        response.raise_for_status()
-        sites_index_list = response.json()
-        print(f"Loaded {len(sites_index_list)} site entries from {url_sites_index}\n")
+        if os.path.exists('precomputed/sites_index.json'):
+            with open('precomputed/sites_index.json', 'r') as f:
+                sites_index_list = json.load(f)
+            print(f"Loaded {len(sites_index_list)} site entries from sites_index.json\n")
+        else:
+            print(f"Warning: sites_index.json not found locally, proceeding with version from {url_sites_index}.")
+            sites_index_list = json.loads(requests.get(url_sites_index, stream=True).text)
+            print(f"Loaded {len(sites_index_list)} site entries from {url_sites_index}\n")
     except Exception as e:
-        print(f"ERROR: Failed to load sites_index.json from URL: {e}")
+        print(f"ERROR: Failed to load sites_index.json: {e}")
     
     site_files = glob.glob('precomputed/all_dts/*.json')
     sites_data = {}
@@ -292,3 +295,4 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Warning: GeoTIFF generation failed: {e}", file=sys.stderr)
         print("Hourly forecasts still saved successfully.")
+

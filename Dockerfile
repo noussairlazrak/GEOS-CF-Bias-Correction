@@ -8,6 +8,7 @@ RUN apt-get -y update \
       && apt-get install -y --no-install-recommends \
       ca-certificates \
       libgomp1 \
+      libexpat1-dev \
       && rm -rf /var/lib/apt/lists/*
 
 RUN uv sync --locked
