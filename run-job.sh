@@ -18,11 +18,11 @@ print(f"container_image_id={data.get('ImageID', '')}")
 print(f"container_name={data.get('Name', '')}")
 print(f"docker_id={data.get('DockerId', '')}")
 
-import rasterio
+# import rasterio
 
 PY
 fi
 
 # Run the actual commands
-uv run python -u generate.py
+uv run python -u generate.py --skip-plotting --skip-openaq --s3-only --model-cache s3
 uv run python -u compress.py
