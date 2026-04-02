@@ -23,5 +23,6 @@ import rasterio
 PY
 fi
 
-# Run the actual command
+# Run the actual commands
+uv run python -u generate.py
 uv run python -u compress.py
