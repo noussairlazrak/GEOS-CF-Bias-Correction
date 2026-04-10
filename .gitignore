@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+logs/locations_log.txt
+MODELS/lgbm_Agam_no2.joblib
+MODELS/lgbm_Agam_no2_features.pkl
+.DS_Store
