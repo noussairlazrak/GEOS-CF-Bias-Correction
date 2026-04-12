@@ -5,6 +5,8 @@ sys.path.insert(1,'MLpred')
 import os
 from MLpred import mlpred
 from MLpred import funcs
+from MLpred.s3_manager import S3Manager
+from MLpred.geos_fp_cnn import read_geos_fp_cnn
 import datetime as dt
 import pandas as pd
 import numpy as np
@@ -15,7 +17,7 @@ import traceback
 import argparse
 import joblib 
 
-# command-line arguments
+# Arguments
 parser = argparse.ArgumentParser(description='Generate and upload forecasts to S3')
 parser.add_argument('--skip-plotting', action='store_true', default=False, help='Skip plot generation')
 parser.add_argument('--skip-openaq', action='store_true', default=False, help='Skip OpenAQ data retrieval')
@@ -23,9 +25,11 @@ parser.add_argument('--s3-only', action='store_true', default=False, help='Only 
 parser.add_argument('--clean-local', action='store_true', default=False, help='Remove local files after S3 upload')
 parser.add_argument('--no-local-save', action='store_true', default=False, help='Save directly to S3 without local files')
 parser.add_argument('--model-cache', choices=['local', 's3'], default='s3', help='Store model CSV cache locally or on S3 (default: s3)')
+parser.add_argument('--force-update', action='store_true', default=False, help='Force update even if files are recent')
+parser.add_argument('--stale-hours', type=int, default=48, help='Hours threshold for considering files stale (default: 48)')
 args = parser.parse_args()
 
-# Configuration
+# Config
 SKIP_PLOTTING = args.skip_plotting
 SKIP_OPENAQ = args.skip_openaq
 S3_ONLY = args.s3_only
@@ -34,62 +38,83 @@ NO_LOCAL_SAVE = args.no_local_save
 SAVE_PLOTS_LOCAL = True
 UPLOAD_PLOTS_S3 = True
 FORECAST_HOURS_THRESHOLD = 5
+STALE_HOURS = args.stale_hours
+FORCE_UPDATE = args.force_update
 
-# Model CSV cache configuration 
-# Use --model-cache local or --model-cache s3 to control
-MODEL_CACHE_SOURCE = args.model_cache  # "local" or "s3"
+# Cache
+MODEL_CACHE_SOURCE = args.model_cache
 
-# S3 bucket and prefixes to check
+# S3
+S3_BUCKET = "smce-geos-cf-public"
+S3_PREFIXES = {
+    "geos_cf": "snwg_forecast_working_files/GEOS_CF",
+    "openaq": "snwg_forecast_working_files/OPENAQ",
+    "plots": "snwg_forecast_working_files/plots",
+    "forecasts": "snwg_forecast_working_files/precomputed/all_dts",
+    "models": "snwg_forecast_working_files/MODELS"
+}
+
+# Init
+s3_manager = S3Manager(bucket_name=S3_BUCKET)
 s3_client = boto3.client("s3")
-s3_bucket = "smce-geos-cf-public"
-s3_prefixes = [
-    "snwg_forecast_working_files/GEOS_CF",
-    "snwg_forecast_working_files/OPENAQ",
-    "snwg_forecast_working_files/plots",
-    "snwg_forecast_working_files/precomputed/all_dts",
-    "snwg_forecast_working_files/MODELS"
-]
 
-# Check S3 connectivity for all required prefixes
-funcs.check_s3_connectivity(s3_bucket, s3_prefixes)
+# Legacy
+s3_bucket = S3_BUCKET
+s3_prefixes = list(S3_PREFIXES.values())
 
-# Create local directories (skip if NO_LOCAL_SAVE)
+# Connectivity
+print("Checking S3 connectivity...")
+connectivity = s3_manager.check_connectivity(s3_prefixes)
+for prefix, status in connectivity.items():
+    print(f"  {prefix}: {'OK' if status else 'FAIL'}")
+
+# Directories
 if not NO_LOCAL_SAVE:
     local_dirs = ["./precomputed/all_dts/", "./plots/"]
     for local_dir in local_dirs:
         os.makedirs(local_dir, exist_ok=True)
         print(f"Directory ready: {local_dir}")
 else:
-    print(f"NO_LOCAL_SAVE mode enabled - saving directly to S3 without local files")
+    print(f"NO_LOCAL_SAVE mode enabled")
 
 if S3_ONLY:
-    print(f"S3_ONLY mode enabled - uploading to S3 (local copies will be kept by default)")
+    print(f"S3_ONLY mode enabled")
 if CLEAN_LOCAL:
-    print(f"CLEAN_LOCAL mode enabled - local files will be removed after S3 upload")
+    print(f"CLEAN_LOCAL mode enabled")
 
-#pulling location database
+# Locations
 url = "https://raw.githubusercontent.com/noussairlazrak/MLpred/refs/heads/main/global.json"
-print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}")
+print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}, STALE_HOURS={STALE_HOURS}")
 data = json.loads(requests.get(url, stream=True).text)
-all_locations = []
-force_update = True 
-#generting the forecasts routine
+all_locations = [] 
+
+# Forecasts
 for key, location_data in list(data.items()):
-    if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "#REMMAQ"):
+    if location_data.get("observation_source") in ("DoS_Missions", "#NASA Pandora", "#REMMAQ"):
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
         lat = location_data["lat"]
         lon = location_data["lon"]
-        print(f"Processing Location: {locname} (lat: {lat}, lon: {lon})")
+        print(f"\nProcessing: {locname} (lat: {lat}, lon: {lon})")
+        
         if location_data["observation_source"] == "DoS_Missions":
+            # Paths
             site_file_path = f'./precomputed/all_dts/{site}.json'
+            s3_key = f"{S3_PREFIXES['forecasts']}/{site}.json"
             
-            # Check if forecast is recent (only if saving locally)
-            if not NO_LOCAL_SAVE and funcs.is_forecast_recent(site_file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
-                print(f"Skipping {locname} - forecast generated within last {FORECAST_HOURS_THRESHOLD} hours")
-                continue
+            # Freshness
+            if not FORCE_UPDATE:
+                if NO_LOCAL_SAVE:
+                    if s3_manager.file_exists(s3_key) and s3_manager.is_file_recent(s3_key, hours_threshold=STALE_HOURS):
+                        age = s3_manager.get_file_age_hours(s3_key)
+                        print(f"Skipping {locname} - recent ({age:.1f}h old)")
+                        continue
+                else:
+                    if funcs.is_forecast_recent(site_file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
+                        print(f"Skipping {locname} - recent")
+                        continue
                 
-            #generting the forecasts routine for GEOS FP CNN
+            # Settings
             site_settings = {'l_name': locname, 
              'species': 'no2', 
              'lat': lat, 
@@ -99,46 +124,65 @@ for key, location_data in list(data.items()):
             }
 
             try:
-                merra2cnn = mlpred.read_geos_fp_cnn(site=site, frequency = 5, lat = lat, lon = lon , silent=False, skip_geosfp = True)
+                merra2cnn = read_geos_fp_cnn(site=site, frequency=5, lat=lat, lon=lon, silent=False, skip_geosfp=True)
                 metadata = None
                 
+                # Forecast
+                forecast_dict = {
+                    "location": site_settings.get("l_name", "N/A"),
+                    "lat": site_settings.get("lat", "N/A"),
+                    "lon": site_settings.get("lon", "N/A"),
+                    "species": "pm25",
+                    "sources": ["merra2", "geoscf"],
+                    "forecasts": merra2cnn if isinstance(merra2cnn, list) else merra2cnn.to_dict(orient='records') if hasattr(merra2cnn, 'to_dict') else merra2cnn,
+                    "metadata": metadata
+                }
+                
+                # Save
                 if NO_LOCAL_SAVE:
-                    # Save directly to S3 without local file
-                    s3_bucket_name = s3_bucket.replace("s3://", "")
-                    s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{site}.json"
-                    if funcs.write_to_s3(merra2cnn, s3_client, s3_bucket_name, s3_key, data_format='json'):
-                        print(f"PM2.5 forecast for {locname} uploaded to S3")
+                    if s3_manager.upload_json(forecast_dict, s3_key):
+                        print(f"PM2.5 forecast for {locname} saved to S3")
                     else:
-                        print(f"Warning: Failed to upload PM2.5 forecast for {locname} to S3")
+                        print(f"Failed to save PM2.5 forecast for {locname}")
                 else:
-                    funcs.save_forecast_to_json(merra2cnn, metadata, site_settings=site_settings, species="pm25", sources=["merra2", "geoscf"], output_path=site_file_path)
-                    # Upload to S3
-                    if funcs.upload_to_s3(site_file_path, s3_client, s3_bucket, s3_prefixes[3]):
-                        print(f"NO2 forecast for {locname} uploaded to S3")
+                    try:
+                        with open(site_file_path, 'w') as f:
+                            json.dump(forecast_dict, f, indent=2, default=str)
+                        print(f"PM2.5 forecast for {locname} saved locally")
+                        
+                        # Upload
+                        s3_manager.upload_file(site_file_path, s3_key)
+                        print(f"PM2.5 forecast for {locname} uploaded to S3")
+                        
+                        # Cleanup
+                        if CLEAN_LOCAL:
+                            os.remove(site_file_path)
+                            print(f"Local file removed: {site_file_path}")
+                    except Exception as e:
+                        print(f"Error saving PM2.5 forecast for {locname}: {e}")
                     
-                    # Clean up local file if requested
-                    if CLEAN_LOCAL:
-                        try:
-                            if os.path.exists(site_file_path):
-                                os.remove(site_file_path)
-                                print(f"Local file removed: {site_file_path}")
-                        except Exception:
-                            pass
             except Exception as e:
-                print(f"Error processing merra 2 forecasts in location {key}: {e}")
+                print(f"Error processing merra2 for {key}: {e}")
                 traceback.print_exc()
             
         if location_data["observation_source"] in ("NASA Pandora", "REMMAQ"):
-            #generting the forecasts routine for GEOS CF with local observations
-            locname = location_data["location_name"]
+            # Paths
             file_path = f'./precomputed/all_dts/{locname}.json'
+            s3_key = f"{S3_PREFIXES['forecasts']}/{locname}.json"
             
-            # Check if forecast is recent (only if saving locally)
-            if not NO_LOCAL_SAVE and funcs.is_forecast_recent(file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
-                print(f"Skipping {locname} - forecast generated within last {FORECAST_HOURS_THRESHOLD} hours")
-                continue
+            # Freshness
+            if not FORCE_UPDATE:
+                if NO_LOCAL_SAVE:
+                    if s3_manager.file_exists(s3_key) and s3_manager.is_file_recent(s3_key, hours_threshold=STALE_HOURS):
+                        age = s3_manager.get_file_age_hours(s3_key)
+                        print(f"Skipping {locname} - recent ({age:.1f}h old)")
+                        continue
+                else:
+                    if funcs.is_forecast_recent(file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
+                        print(f"Skipping {locname} - recent")
+                        continue
             
-            # Set source-specific parameters
+            # Source
             source_type = location_data["observation_source"]
             if source_type == "NASA Pandora":
                 obs_src = 'pandora'
@@ -157,7 +201,7 @@ for key, location_data in list(data.items()):
                 obs_val_col = location_data["obs_options"]["no2"]["val_col"]
                 obs_url = f'REMMAQ/{location_data["obs_options"]["no2"]["file"]}'
             
-            print(f"Using observation source: {obs_src} for {locname}")
+            print(f"Source: {obs_src} for {locname}")
             try:
                 site_settings = {'l_name': locname, 
                  'species': 'no2', 
@@ -211,7 +255,8 @@ for key, location_data in list(data.items()):
                 if merged_data is None:
                     print(f"ERROR: Bias correction failed for {locname}")
                     continue
-                # Use merged_data 
+                
+                # Process
                 forecasts_raw = merged_data
                 metadata = metrics
                 col_map = {"time": "time", "no2": "no2", "localised": "corrected", "value": col_name}
@@ -234,7 +279,7 @@ for key, location_data in list(data.items()):
                     if not aq_data.empty:
                         aq_df = pd.merge(aq_df, aq_data, on="time", how="outer")
                 elif SKIP_OPENAQ:
-                    print(f"Skipping OpenAQ data retrieval (--skip-openaq flag set)")
+                    print(f"Skipping OpenAQ")
 
                 fcast = fcast.set_index("time").reindex(hourly_index).reset_index().rename(columns={"index": "time"})
                 merg = funcs.merge_dataframes([aq_df, fcast], "time", resample="1h", how="outer")
@@ -249,7 +294,7 @@ for key, location_data in list(data.items()):
                 merg_plot = merg.set_index("time").resample("5D").mean()
                 merg_plot = merg_plot.reset_index()
                 
-                # Plot generation
+                # Plotting
                 if not SKIP_PLOTTING:
                     try:
                         local_plot_dir = "./plots"
@@ -268,64 +313,68 @@ for key, location_data in list(data.items()):
                         )
                         print(f"Plot generated for {locname}")
                         
+                        # Upload
+                        if UPLOAD_PLOTS_S3:
+                            plot_s3_key = f"{S3_PREFIXES['plots']}/{locname}.png"
+                            if s3_manager.upload_file(local_plot_path, plot_s3_key):
+                                print(f"Plot for {locname} uploaded to S3")
+                                if CLEAN_LOCAL and os.path.exists(local_plot_path):
+                                    os.remove(local_plot_path)
+                                    print(f"Local plot removed: {local_plot_path}")
+                        
                     except Exception as plot_err:
-                        print(f"Plot generation failed for {locname}: {plot_err}")
+                        print(f"Plot failed for {locname}: {plot_err}")
                         traceback.print_exc()
 
+                # Cutoff
                 cutoff = fcast["time"].max() - pd.DateOffset(months=12)
                 merg = merg[merg["time"] >= cutoff]
                 merg = funcs.convert_times_column(merg, 'time', lat, lon)
                 
+                # NowCast
                 species_map = { 'PM2.5': 'pm25_rh35', 'NO2': 'corrected', 'O3': 'o3' } 
                 avg_hours = { 'NO2': 3, 'O3': 1 }
 
                 merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)
                 print(merg.columns)
 
+                # Forecast
+                forecast_dict = {
+                    "location": site_settings.get("l_name", "N/A"),
+                    "lat": site_settings.get("lat", "N/A"),
+                    "lon": site_settings.get("lon", "N/A"),
+                    "species": "no2",
+                    "sources": ["geoscf", col_name],
+                    "forecasts": merg.to_dict(orient='records'),
+                    "metrics": metadata,
+                    "metadata": metadata
+                }
+                
+                # Save
                 if NO_LOCAL_SAVE:
-                    # Save directly to S3
-                    s3_bucket_name = s3_bucket.replace("s3://", "")
-                    s3_key = f"snwg_forecast_working_files/precomputed/all_dts/{locname}.json"
-                    # Convert DataFrame
-                    merg_dict = merg.to_dict(orient='records')
-                    forecast_dict = {
-                        "location": site_settings.get("l_name", "N/A"),
-                        "lat": site_settings.get("lat", "N/A"),
-                        "lon": site_settings.get("lon", "N/A"),
-                        "species": "no2",
-                        "sources": ["geoscf", col_name],
-                        "forecasts": merg_dict,
-                        "metrics": metadata,
-                        "metadata": metadata
-                    }
-                    if funcs.write_to_s3(forecast_dict, s3_client, s3_bucket_name, s3_key, data_format='json'):
-                        print(f"NO2 forecast for {locname} uploaded to S3")
+                    if s3_manager.upload_json(forecast_dict, s3_key):
+                        print(f"NO2 forecast for {locname} saved to S3")
                     else:
-                        print(f"Warning: Failed to upload NO2 forecast for {locname} to S3")
+                        print(f"Failed to save NO2 forecast for {locname}")
                 else:
-                    funcs.save_forecast_to_json(merg, metadata, site_settings=site_settings, species="no2",sources=["geoscf", col_name], output_path=file_path)
-                    # Adding metrics to the saved JSON file
-                    # Reload, update, and re-save with metrics
                     try:
-                        with open(file_path, 'r') as f:
-                            forecast_json = json.load(f)
-                        forecast_json['metrics'] = metadata
                         with open(file_path, 'w') as f:
-                            json.dump(forecast_json, f, indent=2, default=str)
+                            json.dump(forecast_dict, f, indent=2, default=str)
+                        print(f"NO2 forecast for {locname} saved locally")
+                        
+                        # Upload
+                        s3_manager.upload_file(file_path, s3_key)
+                        print(f"NO2 forecast for {locname} uploaded to S3")
+                        
+                        # Cleanup
+                        if CLEAN_LOCAL:
+                            os.remove(file_path)
+                            print(f"Local file removed: {file_path}")
                     except Exception as e:
-                        print(f"Warning: Could not add metrics to local JSON for {locname}: {e}")
-                    # Upload to S3
-                    if funcs.upload_to_s3(file_path, s3_client, s3_bucket, s3_prefixes[3]):
-                        print(f"no2 forecast for {locname} uploaded to S3")
-                    if CLEAN_LOCAL:
-                        try:
-                            if os.path.exists(file_path):
-                                os.remove(file_path)
-                                print(f"Local file removed: {file_path}")
-                        except Exception:
-                            pass
+                        print(f"Error saving NO2 forecast for {locname}: {e}")
 
             except Exception as e:
-                print(f"Error processing {source_type} location {key}: {e}")
+                print(f"Error processing {source_type} for {key}: {e}")
                 traceback.print_exc()
-print("Forecast generation completed.")
+
+print("\nForecast generation completed.")
