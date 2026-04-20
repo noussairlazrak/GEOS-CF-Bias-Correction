@@ -63,6 +63,7 @@ from IPython.display import HTML
 sys.path.insert(1, 'MLpred')
 from MLpred import mlpred
 from MLpred import funcs
+from MLpred.read_pandora import read_pandora, extract_metadata, convert_no2_mol_m3_to_ppbv
 
 warnings.filterwarnings("ignore")
 
@@ -2305,149 +2306,8 @@ def read_local_obs( obs_url=None, time_col="Time", date_format="%m/%d/%Y %H:%M:%
 
     return allobs
 
-def extract_metadata(content):
-    location_name = re.search(r'Full location name:\s*(.+)', content).group(1).strip()
-    latitude = float(re.search(r'Location latitude \[deg\]:\s*([-\d.]+)', content).group(1))
-    longitude = float(re.search(r'Location longitude \[deg\]:\s*([-\d.]+)', content).group(1))
-    return {
-        'location_name': location_name,
-        'latitude': latitude,
-        'longitude': longitude
-    }
-
-
-def read_pandora(url, pollutant='no2'):
-    response = requests.get(url)
-    content = response.text
-    metadata = mlpred.extract_metadata(content)
-    
-   
-    separator = "---------------------------------------------------------------------------------------"
-    data_start_index = content.index(separator) + len(separator)
-    
-    df = pd.read_csv(url, skiprows=data_start_index, header=None, 
-                     sep='\s+', encoding='ISO-8859-1', on_bad_lines='skip')
-    df = df.iloc[:, :69]
-    df.columns = range(df.shape[1])
-    
-    df['time'] = pd.to_datetime(df[0], format="%Y%m%dT%H%M%S.%fZ")
-    
-    if pollutant.lower() == 'no2':
-        result_df = pd.DataFrame({
-            'time': df['time'],
-            'no2_surface_conc_mol_m3': df[55],
-            'no2_surface_conc_uncertainty': df[56],
-            'no2_surface_conc_index': df[57],
-            'no2_heterogeneity_flag': df[58],
-            'no2_stratospheric_column': df[59],
-            'no2_tropospheric_column': df[61],
-            'no2_layer1_height_km': df[67],
-            'pressure_mbar': df[13],
-            'temperature_k': df[14],
-            'solar_zenith_angle': df[3],
-            'quality_flag_no2': df[52],
-            'integration_time_ms': df[30],
-            'wavelength_shift_nm': df[28]
-        })
-        result_df['lat'] = float(metadata['latitude'])
-        result_df['lon'] = float(metadata['longitude'])
-        result_df['location'] = metadata['location_name']
-        result_df['value'] = df[55] * 1e8
-        
-        numeric_columns = ['no2_surface_conc_mol_m3', 'no2_surface_conc_uncertainty', 'pressure_mbar', 'temperature_k']
-        result_df = result_df[
-            (result_df['no2_surface_conc_mol_m3'] != -9e99)
-            #(result_df['quality_flag_no2'].isin([0, 1, 2]))
-        ]
-        result_df[numeric_columns] = result_df[numeric_columns].apply(pd.to_numeric, errors='coerce')
-        
-        result_df['value'] = mlpred.convert_no2_mol_m3_to_ppbv(df[55], df[14], df[13]) / 40
-        
-        result_df = result_df[
-            #(result_df['no2_surface_conc_index'].isin([1, 2])) &
-            #(result_df['no2_heterogeneity_flag'].isin([0, 1])) &
-            (result_df['value'] > 0) &
-            (result_df['value'] < 100)
-        ]
-        
-    elif pollutant.lower() == 'o3':
-
-        result_df = pd.DataFrame({
-        'time': df['time'],
-        'fractional_day': df[1],
-        'measurement_duration': df[2],
-        'solar_zenith_angle': df[3],
-        'solar_azimuth': df[4],
-        'lunar_zenith_angle': df[5],
-        'lunar_azimuth': df[6],
-        'rms_unweighted': df[7],
-        'rms_weighted': df[8],
-        'expected_rms_unweighted': df[9],
-        'expected_rms_weighted': df[10],
-        'pressure_mbar': df[11],
-        'data_processing_type_index': df[12],
-        'calibration_file_version': df[13],
-        'calibration_validity_start': df[14],
-        'mean_measured_value': df[15],
-        'wavelength_effective_temp_C': df[16],
-        'avg_residual_stray_light_percent': df[17],
-        'retrieved_wavelength_shift_L1': df[18],
-        'retrieved_total_wavelength_shift': df[19],
-        'retrieved_resolution_change_percent': df[20],
-        'integration_time_ms': df[21],
-        'num_bright_count_cycles': df[22],
-        'filterwheel1_position': df[23],
-        'filterwheel2_position': df[24],
-        'atmospheric_variability_percent': df[25],
-        'aerosol_opt_depth_start': df[26],
-        'aerosol_opt_depth_center': df[27],
-        'aerosol_opt_depth_end': df[28],
-        'L1_data_quality_flag': df[29],
-        'L1_quality_sum_DQ1': df[30],
-        'L1_quality_sum_DQ2': df[31],
-        'L2Fit_data_quality_flag': df[32],
-        'L2Fit_quality_sum_DQ1': df[33],
-        'L2Fit_quality_sum_DQ2': df[34],
-        'quality_flag_o3': df[35],
-        'L2_quality_sum_DQ1_ozone': df[36],
-        'L2_quality_sum_DQ2_ozone': df[37],
-        'o3_total_column': df[38],
-        'o3_column_uncertainty': df[39],
-        'o3_structured_uncertainty': df[40],
-        'o3_common_uncertainty': df[41],
-        'o3_total_uncertainty': df[42],
-        'o3_rms_uncertainty': df[43],
-        'temperature_k': df[44],
-        'o3_effective_temp_indep_uncertainty': df[45],
-        'o3_effective_temp_structured_uncertainty': df[46],
-        'o3_effective_temp_common_uncertainty': df[47],
-        'o3_effective_temp_total_uncertainty': df[48],
-        'direct_ozone_air_mass_factor': df[49],
-        'ozone_air_mass_factor_uncertainty': df[50],
-        'diffuse_correction_percent': df[51]
-        })
-
-
-        result_df['lat'] = float(metadata['latitude'])
-        result_df['lon'] = float(metadata['longitude'])
-        result_df['location'] = metadata['location_name']
-        result_df['value'] = df[38]
-        
-        numeric_columns = ['o3_total_column', 'o3_column_uncertainty', 'pressure_mbar', 'temperature_k']
-        result_df[numeric_columns] = result_df[numeric_columns].apply(pd.to_numeric, errors='coerce')
-        
-        result_df = result_df[
-            (result_df['o3_total_column'] != -9e99) &
-            (result_df['quality_flag_o3'].isin([0, 1, 2, 10, 11, 12])) &
-            (result_df['o3_total_column'] >= 0) &
-            (result_df['aerosol_opt_depth_center'] >= 0) &
-            (result_df['o3_total_column'] <= 500)  
-        ]
-        
-    else:
-        raise ValueError("Unsupported pollutant type. Only 'no2' and 'o3' are supported.")
-    
-    return result_df[["time","lat","lon","value","location"]]
+# read_pandora, extract_metadata, and convert_no2_mol_m3_to_ppbv have been
+# moved to MLpred/read_pandora.py and are imported at the top of this file.
 
 
 def read_geos_fp_cnn(base_url=MERRA2CNN, site=None, frequency=30, lat=None, lon=None, silent=True, skip_geosfp = False):
@@ -2587,20 +2447,7 @@ def read_geos_fp_cnn(base_url=MERRA2CNN, site=None, frequency=30, lat=None, lon=
     return all_data
 
 
-def convert_no2_mol_m3_to_ppbv(no2_mol_m3, temperature_k, pressure_mbar):
-    """
-    Convert NO2 concentration from mol/m³ to ppbv.
-    
-    Args:
-        no2_mol_m3 (float): NO2 concentration in mol/m³
-        temperature_k (float): Temperature in Kelvin
-        pressure_mbar (float): Pressure in millibars
-    
-    Returns:
-        float: NO2 concentration in ppbv
-    """
-    pressure_atm = pressure_mbar / 1013.25
-    return no2_mol_m3 * (24.45 * 1e9) / (0.0821 * temperature_k * pressure_atm)
+# convert_no2_mol_m3_to_ppbv is imported from MLpred.read_pandora
 
 def read_validation_set( openaq_id=None, source=None, name=None, url=None, time_col=None, date_format=None, obs_val_col=None, lat_col=None, lon_col=None, species=None, lat=999, lon=-999, unit=None, start=None, end=None, remove_outlier = None, **kwargs, ):
 
