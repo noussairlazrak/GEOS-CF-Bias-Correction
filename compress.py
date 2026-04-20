@@ -70,7 +70,7 @@ def get_forecast_for_hour(site_data, site_name, target_utc, site_index_entry=Non
                     'o3_aqi': forecast.get('o3_aqi'),
                     'pm25': forecast.get('pm25'),
                     'pm25_aqi': forecast.get('pm25_aqi'),
-                    't10m': forecast.get('t10m'),
+                    't': forecast.get('t'),
                     'rh': forecast.get('rh'),
                     'wind_speed': forecast.get('wind_speed')
                 }
