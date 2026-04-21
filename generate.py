@@ -51,7 +51,7 @@ S3_PREFIXES = {
     "openaq": "snwg_forecast_working_files/OPENAQ",
     "plots": "snwg_forecast_working_files/plots",
     "forecasts": "snwg_forecast_working_files/precomputed/all_dts",
-    "models": "snwg_forecast_working_files/MODELS"
+    "models": "snwg_forecast_working_files/MODELS",
     "geos_fp_cnn": "snwg_forecast_working_files/GEOS_FP_CNN"
 }
 
