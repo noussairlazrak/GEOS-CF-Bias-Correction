@@ -91,7 +91,7 @@ all_locations = []
 
 # Forecasts
 for key, location_data in list(data.items()):
-    if location_data.get("observation_source") in ("DoS_Missions", "#NASA Pandora", "#REMMAQ"):
+    if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "REMMAQ"):
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
         lat = location_data["lat"]
@@ -268,18 +268,18 @@ for key, location_data in list(data.items()):
                 hourly_index = pd.date_range(start, end, freq="1H")
                 aq_df = pd.DataFrame({"time": hourly_index})
 
-                sensors = [
-                    s["id"]
-                    for loc in mlpred.get_openaq_locations(lat=float(lat), lon=float(lon), radius=25, parameter="no2")
-                    for s in loc.get("sensors", [])
-                ]
-
-                print(sensors)
-                if sensors and not SKIP_OPENAQ:
-                    aq_data = funcs.openaq_hourly_avgs(sensors, start, end)
-                    if not aq_data.empty:
-                        aq_df = pd.merge(aq_df, aq_data, on="time", how="outer")
-                elif SKIP_OPENAQ:
+                if not SKIP_OPENAQ:
+                    sensors = [
+                        s["id"]
+                        for loc in mlpred.get_openaq_locations(lat=float(lat), lon=float(lon), radius=25, parameter="no2")
+                        for s in loc.get("sensors", [])
+                    ]
+                    print(sensors)
+                    if sensors:
+                        aq_data = funcs.openaq_hourly_avgs(sensors, start, end)
+                        if not aq_data.empty:
+                            aq_df = pd.merge(aq_df, aq_data, on="time", how="outer")
+                else:
                     print(f"Skipping OpenAQ")
 
                 fcast = fcast.set_index("time").reindex(hourly_index).reset_index().rename(columns={"index": "time"})
