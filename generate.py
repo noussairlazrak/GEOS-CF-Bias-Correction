@@ -5,6 +5,7 @@ sys.path.insert(1,'MLpred')
 import os
 from MLpred import mlpred
 from MLpred import funcs
+from MLpred.bias_corrector import get_localised_forecast
 from MLpred.s3_manager import S3Manager
 from MLpred.geos_fp_cnn import read_geos_fp_cnn
 import datetime as dt
@@ -37,7 +38,7 @@ CLEAN_LOCAL = args.clean_local
 NO_LOCAL_SAVE = args.no_local_save
 SAVE_PLOTS_LOCAL = True
 UPLOAD_PLOTS_S3 = True
-FORECAST_HOURS_THRESHOLD = 5
+FORECAST_HOURS_THRESHOLD = 1
 STALE_HOURS = args.stale_hours
 FORCE_UPDATE = args.force_update
 
@@ -91,7 +92,7 @@ all_locations = []
 
 # Forecasts
 for key, location_data in list(data.items()):
-    if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "REMMAQ"):
+    if location_data.get("observation_source") in ("DoS_Missions", "#NASA Pandora", "#REMMAQ"):
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
         lat = location_data["lat"]
@@ -212,8 +213,6 @@ for key, location_data in list(data.items()):
                  'model_src': 's3',
                  'obs_src': obs_src,
                  'openaq_id': None,
-                 'model_tuning' : False,
-                 'model_url': '#',
                  'obs_url': obs_url,
                  'resample' : '1h',
                  'unit' : 'ppb',
@@ -229,7 +228,7 @@ for key, location_data in list(data.items()):
                                      'lon_col': None,
                                      'remove_outlier': False,
                                     }
-                merged_data, metrics, model = mlpred.get_localised_forecast(
+                merged_data, metrics, model = get_localised_forecast(
                     loc=site_settings['l_name'],
                     spec=site_settings['species'],
                     lat=site_settings['lat'],
@@ -237,7 +236,6 @@ for key, location_data in list(data.items()):
                     mod_src=site_settings['model_src'],
                     obs_src=site_settings['obs_src'],
                     openaq_id=site_settings['openaq_id'],
-                    GEOS_CF=site_settings['model_url'],
                     OBS_URL=site_settings['obs_url'],
                     st=site_settings['start'],
                     ed=site_settings['end'],
@@ -251,91 +249,74 @@ for key, location_data in list(data.items()):
                     lat_col=obs_settings['lat_col'],
                     lon_col=obs_settings['lon_col'],
                     silent=site_settings['silent'],
-                    force_retrain=True
+                    force_retrain=True,    
+                    force_obs_refresh=True,
+                    model_max_age_days=7,  
+                    s3_manager=s3_manager,
                 )
                 if merged_data is None:
                     print(f"ERROR: Bias correction failed for {locname}")
                     continue
                 
-                # Process
-                forecasts_raw = merged_data
+
                 metadata = metrics
-                col_map = {"time": "time", "no2": "no2", "localised": "corrected", "value": col_name}
-                fcast = forecasts_raw[[c for c in ["time", "no2", "localised", "value", "o3", "pm25_rh35", "rh","t","tprec","hcho"] if c in forecasts_raw.columns]].rename(columns=col_map)
-                fcast.iloc[:, 1:] = fcast.iloc[:, 1:].clip(lower=0)
+                col_map = {"no2": "no2", "localised": "corrected", "value": col_name}
+                keep_cols = [c for c in ["time", "no2", "localised", "value", "o3", "pm25_rh35", "rh", "t", "tprec", "hcho"] if c in merged_data.columns]
+                fcast = merged_data[keep_cols].rename(columns=col_map).copy()
 
-                start, end = fcast["time"].min(), fcast["time"].max()
-                hourly_index = pd.date_range(start, end, freq="1H")
-                aq_df = pd.DataFrame({"time": hourly_index})
+                # Deduplicate and sort
+                fcast = fcast.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
 
-                if not SKIP_OPENAQ:
-                    sensors = [
-                        s["id"]
-                        for loc in mlpred.get_openaq_locations(lat=float(lat), lon=float(lon), radius=25, parameter="no2")
-                        for s in loc.get("sensors", [])
-                    ]
-                    print(sensors)
-                    if sensors:
-                        aq_data = funcs.openaq_hourly_avgs(sensors, start, end)
-                        if not aq_data.empty:
-                            aq_df = pd.merge(aq_df, aq_data, on="time", how="outer")
-                else:
-                    print(f"Skipping OpenAQ")
+                # Clip negatives
+                num_cols = fcast.select_dtypes(include=["float", "int"]).columns
+                fcast[num_cols] = fcast[num_cols].clip(lower=0)
 
-                fcast = fcast.set_index("time").reindex(hourly_index).reset_index().rename(columns={"index": "time"})
-                merg = funcs.merge_dataframes([aq_df, fcast], "time", resample="1h", how="outer")
+                # corrected is at least 0.1
+                if "corrected" in fcast.columns:
+                    fcast["corrected"] = fcast["corrected"].apply(lambda x: x if pd.notna(x) and x > 0 else 0.1)
 
-                for col in ["no2", "corrected", col_name, "avg"]:
-                    merg[col] = merg.get(col, np.nan)
+                # Round numerics
+                fcast[fcast.select_dtypes(include=["float", "int"]).columns] = fcast.select_dtypes(include=["float", "int"]).round(2)
 
-                merg["corrected"] = merg["corrected"].apply(lambda x: x if x > 0 else 0.1)
-                merg["avg"] = merg["avg"]*1000
-                merg[merg.select_dtypes(include=["float", "int"]).columns] = merg.select_dtypes(include=["float", "int"]).round(2)
-
-                merg_plot = merg.set_index("time").resample("5D").mean()
-                merg_plot = merg_plot.reset_index()
-                
                 # Plotting
                 if not SKIP_PLOTTING:
                     try:
                         local_plot_dir = "./plots"
                         os.makedirs(local_plot_dir, exist_ok=True)
                         local_plot_path = os.path.join(local_plot_dir, f"{locname}.png")
-                        
+                        plot_cols = [c for c in ["no2", "corrected", col_name] if c in fcast.columns]
+                        colors = ['black', 'grey', 'red'][:len(plot_cols)]
+                        styles = ['--', '-', '-'][:len(plot_cols)]
+                        fcast_plot = fcast.set_index("time").resample("5D").mean().reset_index()
                         funcs.gen_plot(
-                            merg_plot,
-                            [['no2', 'corrected', col_name, 'avg']],
-                            [['black', 'grey', 'red', 'green']],
-                            [['--', '-', '-', '-']],
+                            fcast_plot,
+                            [plot_cols],
+                            [colors],
+                            [styles],
                             'NO2',
                             [f'{locname}'],
                             sv_pth=local_plot_path,
                             resample='1D'
                         )
                         print(f"Plot generated for {locname}")
-                        
-                        # Upload
                         if UPLOAD_PLOTS_S3:
                             plot_s3_key = f"{S3_PREFIXES['plots']}/{locname}.png"
                             if s3_manager.upload_file(local_plot_path, plot_s3_key):
                                 print(f"Plot for {locname} uploaded to S3")
                                 if CLEAN_LOCAL and os.path.exists(local_plot_path):
                                     os.remove(local_plot_path)
-                                    print(f"Local plot removed: {local_plot_path}")
-                        
                     except Exception as plot_err:
                         print(f"Plot failed for {locname}: {plot_err}")
                         traceback.print_exc()
 
-                # Cutoff
-                cutoff = fcast["time"].max() - pd.DateOffset(months=12)
-                merg = merg[merg["time"] >= cutoff]
-                merg = funcs.convert_times_column(merg, 'time', lat, lon)
-                
-                # NowCast
-                species_map = { 'PM2.5': 'pm25_rh35', 'NO2': 'corrected', 'O3': 'o3' } 
-                avg_hours = { 'NO2': 3, 'O3': 1 }
 
+                cutoff = fcast["time"].max() - pd.DateOffset(months=12)
+                merg = fcast[fcast["time"] >= cutoff].copy()
+                merg = funcs.convert_times_column(merg, 'time', lat, lon)
+
+                # NowCast
+                species_map = {'PM2.5': 'pm25_rh35', 'NO2': 'corrected', 'O3': 'o3'}
+                avg_hours = {'NO2': 3, 'O3': 1}
                 merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)
                 print(merg.columns)
 
@@ -367,7 +348,7 @@ for key, location_data in list(data.items()):
                         s3_manager.upload_file(file_path, s3_key)
                         print(f"NO2 forecast for {locname} uploaded to S3")
                         
-                        # Cleanup
+                        # Cleaning
                         if CLEAN_LOCAL:
                             os.remove(file_path)
                             print(f"Local file removed: {file_path}")

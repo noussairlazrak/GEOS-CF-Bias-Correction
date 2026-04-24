@@ -313,9 +313,17 @@ def _find_station(df: pd.DataFrame,
 def _reshape_to_timeseries(df: pd.DataFrame) -> pd.DataFrame:
     """
     Deduplicate and sort a station-filtered GeoJSON frame by time.
+
+    GeoJSON slots arrive at UTC offsets 1h, 4h, 7h … (i.e. 01:00, 04:00 …)
+    while GEOS-CF data uses a standard 0h, 3h, 6h … grid.  Rounding to the
+    nearest 3-hour boundary here ensures that both sources land in the same
+    resample bin so that ``merge_dataframes(..., resample="3h")`` can combine
+    them without introducing spurious NaN rows.
     """
     if df.empty:
         return df
+    df = df.copy()
+    df["time"] = df["time"].dt.round("3h")
     return (
         df
         .sort_values("time")
@@ -491,6 +499,15 @@ def read_geos_fp_cnn(
     merg = funcs.merge_dataframes([all_data, geos_cf], "time", resample="3h", how="outer")
     if not silent:
         print("Merged columns:", merg.columns.tolist())
+
+    # Drop rows where ALL core GEOS-CF variables are NaN (stale cache ghost rows)
+    core_cols = [c for c in ["pm25_rh35", "no2", "o3", "t", "rh"] if c in merg.columns]
+    if core_cols:
+        before = len(merg)
+        merg = merg.dropna(subset=core_cols, how="all").reset_index(drop=True)
+        dropped = before - len(merg)
+        if not silent and dropped:
+            print(f"Dropped {dropped} rows with no GEOS-CF data (likely stale cache rows)")
 
     # Fill missing GEOS FP CNN values with GEOS-CF PM2.5 (pm25_rh35)
     filled_counts: dict = {}
