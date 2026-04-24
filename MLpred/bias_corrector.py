@@ -821,6 +821,9 @@ def get_localised_forecast(
                   f"{n_obs} with observations, "
                   f"{len(result) - n_obs} forecast-only")
 
+        # Overall AQI
+        result = funcs.calculate_overall_aqi(result)
+
         return result, metrics, model_lgb
 
     except Exception as exc:

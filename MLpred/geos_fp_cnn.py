@@ -526,6 +526,7 @@ def read_geos_fp_cnn(
     species_map = {"PM2.5": "pm25_rh35", "NO2": "no2", "O3": "o3"}
     avg_hours   = {"NO2": 3, "O3": 1}
     merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)
+    merg = funcs.calculate_overall_aqi(merg)
 
     if "pm25_aqi" in merg.columns and "PM25_NowCast_AQI" in merg.columns:
         missing_mask = merg["pm25_aqi"].isna()

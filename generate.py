@@ -92,7 +92,7 @@ all_locations = []
 
 # Forecasts
 for key, location_data in list(data.items()):
-    if location_data.get("observation_source") in ("DoS_Missions", "#NASA Pandora", "#REMMAQ"):
+    if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "REMMAQ"):
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
         lat = location_data["lat"]
@@ -127,6 +127,7 @@ for key, location_data in list(data.items()):
 
             try:
                 merra2cnn = read_geos_fp_cnn(site=site, frequency=5, lat=lat, lon=lon, silent=False, skip_geosfp=True)
+                merra2cnn = funcs.calculate_overall_aqi(merra2cnn)
                 metadata = None
                 
                 # Forecast
@@ -249,8 +250,8 @@ for key, location_data in list(data.items()):
                     lat_col=obs_settings['lat_col'],
                     lon_col=obs_settings['lon_col'],
                     silent=site_settings['silent'],
-                    force_retrain=True,    
-                    force_obs_refresh=True,
+                    force_retrain=False,    
+                    force_obs_refresh=False,
                     model_max_age_days=7,  
                     s3_manager=s3_manager,
                 )
@@ -318,6 +319,7 @@ for key, location_data in list(data.items()):
                 species_map = {'PM2.5': 'pm25_rh35', 'NO2': 'corrected', 'O3': 'o3'}
                 avg_hours = {'NO2': 3, 'O3': 1}
                 merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)
+                merg = funcs.calculate_overall_aqi(merg)
                 print(merg.columns)
 
                 # Forecast

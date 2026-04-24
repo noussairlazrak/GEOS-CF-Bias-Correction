@@ -72,7 +72,8 @@ def get_forecast_for_hour(site_data, site_name, target_utc, site_index_entry=Non
                     'pm25_aqi': forecast.get('pm25_aqi'),
                     't': forecast.get('t'),
                     'rh': forecast.get('rh'),
-                    'wind_speed': forecast.get('wind_speed')
+                    'wind_speed': forecast.get('wind_speed'),
+                    'overall_aqi': forecast.get('overall_aqi')
                 }
         
         closest_forecast = None
@@ -110,7 +111,8 @@ def get_forecast_for_hour(site_data, site_name, target_utc, site_index_entry=Non
                 'pm25_aqi': closest_forecast.get('pm25_aqi'),
                 't': closest_forecast.get('t'),
                 'rh': closest_forecast.get('rh'),
-                'wind_speed': closest_forecast.get('wind_speed')
+                'wind_speed': closest_forecast.get('wind_speed'),
+                'overall_aqi': forecast.get('overall_aqi')
             }
     except Exception as e:
         pass

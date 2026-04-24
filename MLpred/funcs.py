@@ -869,7 +869,24 @@ def calculate_nowcast(df, species_columns=None, avg_hours=None):
     except Exception as e:
         print(f"Error in calculate_nowcast: {e}")
         return df if 'df' in locals() else pd.DataFrame()
-    
+
+
+def calculate_overall_aqi(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add an ``overall_aqi`` column = max(PM25_NowCast_AQI, NO2_AQI, O3_AQI).
+
+    Expects ``calculate_nowcast`` to have been called first so the sub-index
+    columns exist.  Missing sub-indices are ignored (NaN-safe).
+
+    Returns the DataFrame with ``overall_aqi`` appended.
+    """
+    aqi_cols = [c for c in ("PM25_NowCast_AQI", "NO2_AQI") if c in df.columns]
+    if aqi_cols:
+        df["overall_aqi"] = df[aqi_cols].max(axis=1)
+    else:
+        df["overall_aqi"] = np.nan
+    return df
+
 def log_if_condition(condition, message, log_file="logs/locations_log.txt"):
     """Log management routine"""
     try:
