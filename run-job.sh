@@ -24,5 +24,6 @@ PY
 fi
 
 # Run the actual commands
-uv run python -u generate.py --skip-plotting --skip-openaq --s3-only --model-cache s3
-uv run python -u compress.py
+# uv run python -u generate.py --skip-plotting --skip-openaq --s3-only --model-cache s3
+# uv run python -u compress.py
+uv run python -u generate.py --skip-plotting --skip-openaq --s3-only --model-cache s3 && uv run python -u compress.py
