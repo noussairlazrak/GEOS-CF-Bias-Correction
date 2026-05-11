@@ -7,7 +7,7 @@ from MLpred import mlpred
 from MLpred import funcs
 from MLpred.bias_corrector import get_localised_forecast
 from MLpred.s3_manager import S3Manager
-from MLpred.geos_fp_cnn import read_geos_fp_cnn
+from MLpred.geos_fp_cnn import read_geos_fp_cnn, load_geojson_all_locations
 import datetime as dt
 import pandas as pd
 import numpy as np
@@ -27,6 +27,10 @@ parser.add_argument('--clean-local', action='store_true', default=False, help='R
 parser.add_argument('--no-local-save', action='store_true', default=False, help='Save directly to S3 without local files')
 parser.add_argument('--model-cache', choices=['local', 's3'], default='s3', help='Store model CSV cache locally or on S3 (default: s3)')
 parser.add_argument('--force-update', action='store_true', default=False, help='Force update even if files are recent')
+parser.add_argument('--force-source', nargs='+', default=[], metavar='SOURCE',
+                    help='Force update only for specific observation sources (e.g. --force-source "NASA Pandora" DoS_Missions)')
+parser.add_argument('--skip-source', nargs='+', default=[], metavar='SOURCE',
+                    help='Skip one or more observation sources entirely (e.g. --skip-source DoS_Missions REMMAQ)')
 parser.add_argument('--stale-hours', type=int, default=48, help='Hours threshold for considering files stale (default: 48)')
 args = parser.parse_args()
 
@@ -41,6 +45,8 @@ UPLOAD_PLOTS_S3 = True
 FORECAST_HOURS_THRESHOLD = 1
 STALE_HOURS = args.stale_hours
 FORCE_UPDATE = args.force_update
+FORCE_SOURCES = [s.strip() for s in args.force_source]  
+SKIP_SOURCES  = [s.strip() for s in args.skip_source]   
 
 # Cache
 MODEL_CACHE_SOURCE = args.model_cache
@@ -86,26 +92,51 @@ if CLEAN_LOCAL:
 
 # Locations
 url = "https://raw.githubusercontent.com/noussairlazrak/MLpred/refs/heads/main/global.json"
-print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}, STALE_HOURS={STALE_HOURS}")
+print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}, STALE_HOURS={STALE_HOURS}, FORCE_SOURCES={FORCE_SOURCES}, SKIP_SOURCES={SKIP_SOURCES}")
 data = json.loads(requests.get(url, stream=True).text)
 all_locations = [] 
+
+# Pre-check
+print("\nChecking GEOS-FP endpoint connectivity …")
+_today = dt.datetime.today()
+SKIP_GEOSFP = True
+for _day_offset in (0, 1):
+    _attempt = _today - dt.timedelta(days=_day_offset)
+    _label = "current" if _day_offset == 0 else "-1 day"
+    print(f"  Trying {_label} ({_attempt.strftime('%Y-%m-%d')}) …")
+    _gdf = load_geojson_all_locations(date=_attempt, silent=False)
+    if not _gdf.empty:
+        print(f"  GEOS-FP GeoJSON available ({_label}).")
+        SKIP_GEOSFP = False
+        break
+else:
+    print("  No GEOS-FP GeoJSON found")
 
 # Forecasts
 for key, location_data in list(data.items()):
     if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "REMMAQ"):
+        obs_source = location_data["observation_source"]
+
+
+        if SKIP_SOURCES and obs_source in SKIP_SOURCES:
+            print(f"Skipping {obs_source} (--skip-source)")
+            continue
+
         site = location_data['location_name'].replace(" ", "_")
         locname = location_data["location_name"]
         lat = location_data["lat"]
         lon = location_data["lon"]
         print(f"\nProcessing: {locname} (lat: {lat}, lon: {lon})")
-        
+
+        force_this = FORCE_UPDATE or (obs_source in FORCE_SOURCES)
+
         if location_data["observation_source"] == "DoS_Missions":
             # Paths
             site_file_path = f'./precomputed/all_dts/{site}.json'
             s3_key = f"{S3_PREFIXES['forecasts']}/{site}.json"
             
             # Freshness
-            if not FORCE_UPDATE:
+            if not force_this:
                 if NO_LOCAL_SAVE:
                     if s3_manager.file_exists(s3_key) and s3_manager.is_file_recent(s3_key, hours_threshold=STALE_HOURS):
                         age = s3_manager.get_file_age_hours(s3_key)
@@ -126,7 +157,7 @@ for key, location_data in list(data.items()):
             }
 
             try:
-                merra2cnn = read_geos_fp_cnn(site=site, frequency=5, lat=lat, lon=lon, silent=False, skip_geosfp=True)
+                merra2cnn = read_geos_fp_cnn(site=site, frequency=5, lat=lat, lon=lon, silent=False, skip_geosfp=SKIP_GEOSFP)
                 merra2cnn = funcs.calculate_overall_aqi(merra2cnn)
                 metadata = None
                 
@@ -174,7 +205,7 @@ for key, location_data in list(data.items()):
             s3_key = f"{S3_PREFIXES['forecasts']}/{locname}.json"
             
             # Freshness
-            if not FORCE_UPDATE:
+            if not force_this:
                 if NO_LOCAL_SAVE:
                     if s3_manager.file_exists(s3_key) and s3_manager.is_file_recent(s3_key, hours_threshold=STALE_HOURS):
                         age = s3_manager.get_file_age_hours(s3_key)

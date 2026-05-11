@@ -880,7 +880,7 @@ def calculate_overall_aqi(df: pd.DataFrame) -> pd.DataFrame:
 
     Returns the DataFrame with ``overall_aqi`` appended.
     """
-    aqi_cols = [c for c in ("PM25_NowCast_AQI", "NO2_AQI") if c in df.columns]
+    aqi_cols = [c for c in ("pm25_aqi", "NO2_AQI","PM25_NowCast_AQI") if c in df.columns]
     if aqi_cols:
         df["overall_aqi"] = df[aqi_cols].max(axis=1)
     else:

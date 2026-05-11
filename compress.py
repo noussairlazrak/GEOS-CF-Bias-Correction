@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Generate pre-computed hourly forecast snapshot files for 3 days in advance.
+Generate pre-computed hourly forecast snapshot files.
 This script reads all individual site forecast files and creates lightweight
-snapshots for every hour of the current day + 3 days ahead (96 hours total).
+snapshots covering the previous 24 hours and the next 3 days (96 hours total).
 
 Usage:
     python3 compress.py
@@ -11,7 +11,7 @@ Output:
     precomputed/hourly_forecasts/YYYY-MM-DD_HH.json
     Example: precomputed/hourly_forecasts/2026-03-16_04.json (for 4:00 AM)
     
-    Generates 96 files for current + 3 days ahead, rotating every hour.
+    Generates 96 files: 24 past hours + 72 future hours, overwritten on each run.
 """
 
 import json
@@ -56,25 +56,15 @@ def get_forecast_for_hour(site_data, site_name, target_utc, site_index_entry=Non
         
         for forecast in site_data.get('forecasts', []):
             if forecast.get('time') == target_hour_utc:
-                return {
-                    'location_name': site_name,
-                    'timezone': timezone_str,
-                    'species': species,
-                    'sources': sources,
-                    'observation_source': site_data.get('observation_source', 'NASA'),
-                    'time': target_hour_utc,
-                    'local_time': forecast.get('local_time'),
-                    'no2': forecast.get('no2'),
-                    'no2_aqi': forecast.get('no2_aqi'),
-                    'o3': forecast.get('o3'),
-                    'o3_aqi': forecast.get('o3_aqi'),
-                    'pm25': forecast.get('pm25'),
-                    'pm25_aqi': forecast.get('pm25_aqi'),
-                    't': forecast.get('t'),
-                    'rh': forecast.get('rh'),
-                    'wind_speed': forecast.get('wind_speed'),
-                    'overall_aqi': forecast.get('overall_aqi')
-                }
+                # Return forecast with all original fields (no subsetting)
+                result = forecast.copy()
+                # Ensure metadata fields are present
+                result['location_name'] = site_name
+                result['timezone'] = timezone_str
+                result['species'] = species
+                result['sources'] = sources
+                result['observation_source'] = site_data.get('observation_source', 'NASA')
+                return result
         
         closest_forecast = None
         min_diff = float('inf')
@@ -95,25 +85,13 @@ def get_forecast_for_hour(site_data, site_name, target_utc, site_index_entry=Non
                 pass
         
         if closest_forecast:
-            return {
-                'location_name': site_name,
-                'timezone': timezone_str,
-                'species': species,
-                'sources': sources,
-                'observation_source': site_data.get('observation_source', 'NASA'),
-                'time': target_hour_utc,
-                'local_time': closest_forecast.get('local_time'),
-                'no2': closest_forecast.get('no2'),
-                'no2_aqi': closest_forecast.get('no2_aqi'),
-                'o3': closest_forecast.get('o3'),
-                'o3_aqi': closest_forecast.get('o3_aqi'),
-                'pm25': closest_forecast.get('pm25'),
-                'pm25_aqi': closest_forecast.get('pm25_aqi'),
-                't': closest_forecast.get('t'),
-                'rh': closest_forecast.get('rh'),
-                'wind_speed': closest_forecast.get('wind_speed'),
-                'overall_aqi': forecast.get('overall_aqi')
-            }
+            result = closest_forecast.copy()
+            result['location_name'] = site_name
+            result['timezone'] = timezone_str
+            result['species'] = species
+            result['sources'] = sources
+            result['observation_source'] = site_data.get('observation_source', 'NASA')
+            return result
     except Exception as e:
         pass
     
@@ -126,10 +104,11 @@ def generate_all_hourly_snapshots():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     now_utc = datetime.now(ZoneInfo('UTC'))
-    num_hours = 96
+    start_utc = now_utc - timedelta(hours=24)
+    num_hours = 96                             
     
     print(f"Generating {num_hours} hourly forecast files...")
-    print(f"Starting from: {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"Coverage: {start_utc.strftime('%Y-%m-%d %H:%M UTC')} → {(start_utc + timedelta(hours=num_hours-1)).strftime('%Y-%m-%d %H:%M UTC')}")
     
     sites_index_list = []
     try:
@@ -162,7 +141,7 @@ def generate_all_hourly_snapshots():
     
     for hour_offset in range(num_hours):
         try:
-            target_utc = now_utc + timedelta(hours=hour_offset)
+            target_utc = start_utc + timedelta(hours=hour_offset)
             filename = target_utc.strftime('%Y-%m-%d_%H.json')
             filepath = output_dir / filename
             
@@ -215,8 +194,8 @@ def generate_all_hourly_snapshots():
         except Exception as e:
             failed_hours += 1
     
-    print(f"\nCleaning up old files (keeping last 96 hours)...")
-    cutoff_time = datetime.now().timestamp() - (96 * 3600)
+    print(f"\nCleaning up old files (keeping coverage window)...")
+    cutoff_time = (start_utc - timedelta(hours=1)).timestamp()
     removed_count = 0
     
     for old_file in output_dir.glob('*.json'):
@@ -231,8 +210,8 @@ def generate_all_hourly_snapshots():
     print(f"Directory: {output_dir}")
     print(f"Coverage: {num_hours} hours ({num_hours/24:.1f} days)")
     print(f"Time range:")
-    print(f"    Start: {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"    End:   {(now_utc + timedelta(hours=num_hours-1)).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"    Start: {start_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} (24h ago)")
+    print(f"    End:   {(start_utc + timedelta(hours=num_hours-1)).strftime('%Y-%m-%d %H:%M:%S UTC')} (+3 days)")
     print(f"{'='*60}")
     
     return len(generated_files)
@@ -240,7 +219,7 @@ def generate_all_hourly_snapshots():
 if __name__ == '__main__':
     print("Generating hourly forecast snapshots for 3 days...\n")
     
-    # Check S3 connectivity first
+    # Check S3 connectivity
     print("=== Checking S3 Connectivity ===")
     try:
         s3_client = boto3.client("s3")
