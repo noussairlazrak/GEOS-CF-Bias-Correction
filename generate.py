@@ -42,7 +42,7 @@ CLEAN_LOCAL = args.clean_local
 NO_LOCAL_SAVE = args.no_local_save
 SAVE_PLOTS_LOCAL = True
 UPLOAD_PLOTS_S3 = True
-FORECAST_HOURS_THRESHOLD = 1
+FORECAST_HOURS_THRESHOLD = 3
 STALE_HOURS = args.stale_hours
 FORCE_UPDATE = args.force_update
 FORCE_SOURCES = [s.strip() for s in args.force_source]  
@@ -110,7 +110,7 @@ for _day_offset in (0, 1):
         SKIP_GEOSFP = False
         break
 else:
-    print("  No GEOS-FP GeoJSON found")
+    print("No GEOS-FP GeoJSON found")
 
 # Forecasts
 for key, location_data in list(data.items()):
@@ -152,7 +152,7 @@ for key, location_data in list(data.items()):
              'species': 'no2', 
              'lat': lat, 
              'lon': lon,
-             'silent': True,
+             'silent': False,
              'model_src': 's3',
             }
 
@@ -241,7 +241,7 @@ for key, location_data in list(data.items()):
                  'species': 'no2', 
                  'lat': lat, 
                  'lon': lon,
-                 'silent': True,
+                 'silent': False,
                  'model_src': 's3',
                  'obs_src': obs_src,
                  'openaq_id': None,

@@ -15,8 +15,6 @@ Key features
   generation is fast after the first run.
 * GEOS-CF V1 (replay) is used for training; V2 provides the most-recent
   analysis window and the 5-day forecast horizon.
-
-Author: Noussair Lazrak
 """
 
 import sys
@@ -655,7 +653,7 @@ def train_global_model_from_local(
             if os.path.exists(fpath):
                 try:
                     df = pd.read_csv(fpath, parse_dates=["time"])
-                    df["time"] = pd.to_datetime(df["time"]).dt.floor("H")
+                    df["time"] = _normalize_time(df["time"])
                     frames_g.append(df)
                 except Exception:
                     pass
@@ -983,7 +981,7 @@ def _load_observations(obs_src: str, obs_url: str,
                   f"({os.path.basename(cache_file)})")
         df = read_pandora(obs_url, pollutant=spec,
                           cache=True, cache_hours=cache_hours, silent=silent)
-        df["time"] = pd.to_datetime(df["time"]).dt.floor("H")
+        df["time"] = _normalize_time(df["time"])
         return df
 
     # Generic path (OpenAQ, local CSV, …)
@@ -999,9 +997,24 @@ def _load_observations(obs_src: str, obs_url: str,
     if site._obs is None or (hasattr(site._obs, "empty") and site._obs.empty):
         return pd.DataFrame()
     df = site._obs.copy()
-    df["time"] = pd.to_datetime(df["time"]).dt.floor("H")
+    df["time"] = _normalize_time(df["time"])
     return df
 
+def _normalize_time(series):
+    """
+    Convert mixed datetime strings to UTC, floor to hour,
+    then remove timezone so all merges use datetime64[ns].
+    """
+    return (
+        pd.to_datetime(
+            series,
+            utc=True,
+            format="mixed",
+            errors="coerce"
+        )
+        .dt.floor("h")
+        .dt.tz_localize(None)
+    )
 
 def _add_atmospheric_features(df: pd.DataFrame, spec: str = "no2") -> pd.DataFrame:
     """
@@ -1220,14 +1233,14 @@ def get_localised_forecast(
         # Combine V1 + V2 
         frames = []
         if geos_v1 is not None and not geos_v1.empty:
-            geos_v1["time"] = pd.to_datetime(geos_v1["time"]).dt.floor("H")
+            geos_v1["time"] = _normalize_time(geos_v1["time"])
             frames.append(geos_v1)
             if not silent:
                 print(f"INFO: V1 → {len(geos_v1)} rows "
                       f"({geos_v1['time'].min()} → {geos_v1['time'].max()})")
 
         if geos_v2 is not None and not geos_v2.empty:
-            geos_v2["time"] = pd.to_datetime(geos_v2["time"]).dt.floor("H")
+            geos_v2["time"] = _normalize_time(geos_v2["time"])
             frames.append(geos_v2)
             if not silent:
                 print(f"INFO: V2 → {len(geos_v2)} rows "
@@ -1247,110 +1260,276 @@ def get_localised_forecast(
             print(f"INFO: Combined GEOS-CF → {len(geos_data)} rows "
                   f"({geos_data['time'].min()} → {geos_data['time'].max()})")
 
-        # Model
+        # ==================================================================
+        # Model selection — priority order:
+        #   1. Local pre-trained model  (MODELS/lgbm_<loc>_<spec>_basic.joblib)
+        #   2. Global pre-trained model (MODELS/global_<spec>_model.joblib  OR
+        #                                MODELS/lgbm_global_<spec>_basic.joblib)
+        #   3. S3 local-site model
+        #   4. S3 global model
+        #   5. Train a new local model (only if ALL above are unavailable or poor)
+        # Minimum acceptable R² threshold = 0.50
+        # ==================================================================
+        R2_MIN_THRESHOLD = 0.50
+        import json as _json
+
         model_lgb, sel_feats, metrics = None, None, {}
         model_path, feature_path, metrics_path = _model_local_paths(loc_clean, spec)
 
-        local_ready = (
-            os.path.exists(model_path) and
-            os.path.exists(feature_path) and
-            not force_retrain and
-            _is_model_fresh(loc_clean, spec, max_age_days=model_max_age_days)
-        )
+        # ------------------------------------------------------------------
+        # Helper: load and evaluate any model file
+        # ------------------------------------------------------------------
+        def _load_and_eval(mdl_path, feat_path, met_path=None, label="model"):
+            """
+            Load a model + feature payload from disk.
+            Returns (model, feats, target_mode, r2, full_metrics_dict)
+            or (None, None, None, None, None) on failure.
+            """
+            try:
+                m   = joblib.load(mdl_path)
+                pay = pickle.load(open(feat_path, "rb"))
+                feats  = pay["features"] if isinstance(pay, dict) else pay
+                tmode  = pay.get("target", "absolute") if isinstance(pay, dict) else "absolute"
+                mets   = {"source": label, "target": tmode}
+                if met_path and os.path.exists(met_path):
+                    try:
+                        with open(met_path) as _ff:
+                            _pm = _json.load(_ff)
+                        mets.update({k: _pm.get(k) for k in
+                                     ("RMSE", "R2", "MAE", "n_train", "trained_at",
+                                      "global_CV_RMSE", "global_CV_R2")})
+                    except Exception:
+                        pass
+                return m, feats, tmode, mets.get("R2"), mets
+            except Exception as _le:
+                if not silent:
+                    print(f"WARNING: Could not load {label} from {mdl_path}: {_le}")
+                return None, None, None, None, None
 
-        if local_ready:
+        def _eval_on_obs(m, feats, tmode):
+            """
+            Evaluate model *m* against obs/GEOS overlap. Returns (rmse, r2, mae).
+            """
+            try:
+                _ev = (geos_data.merge(obs_data[["time", "value"]], on="time", how="inner")
+                                .dropna(subset=["value"]))
+                if len(_ev) < 10:
+                    return None, None, None
+                _ev = _add_atmospheric_features(_ev, spec=spec)
+                _edf = funcs.clean_feature_names(_ev.copy())
+
+                def _cf(n):
+                    return funcs.clean_feature_names(pd.DataFrame(columns=[n])).columns[0]
+
+                _fc = [_cf(f) for f in feats]
+                _fa = [f for f in _fc if f in _edf.columns]
+                _X  = _edf[_fa].ffill().bfill().fillna(_edf[_fa].median())
+                for _mf in m.feature_name_:
+                    if _mf not in _X.columns:
+                        _X[_mf] = 0.0
+                _X = _X[m.feature_name_]
+                _y = _ev["value"].values
+                _rc = _cf(spec)
+                if tmode == "ratio" and _rc in _edf.columns:
+                    _p = _edf[_rc].values * np.clip(m.predict(_X), 0.05, 20.0)
+                else:
+                    _p = m.predict(_X)
+                return (float(np.sqrt(mean_squared_error(_y, _p))),
+                        float(r2_score(_y, _p)),
+                        float(mean_absolute_error(_y, _p)))
+            except Exception as _ee:
+                if not silent:
+                    print(f"WARNING: Eval failed: {_ee}")
+                return None, None, None
+
+        # ------------------------------------------------------------------
+        # Step 1 — local pre-trained model
+        # ------------------------------------------------------------------
+        local_r2 = None
+        if not force_retrain and os.path.exists(model_path) and os.path.exists(feature_path):
             if not silent:
                 age_h = (dt.datetime.now().timestamp() - os.path.getmtime(model_path)) / 3600
-                print(f"INFO: Loading model from local cache ({age_h:.1f}h old) → {model_path}")
-            model_lgb = joblib.load(model_path)
-            payload   = pickle.load(open(feature_path, "rb"))
+                print(f"INFO: Found local model ({age_h:.1f}h old) → {model_path}")
+            _m, _f, _t, _r2_stored, _mets = _load_and_eval(
+                model_path, feature_path, metrics_path, label="local")
+            if _m is not None:
+                # Evaluate live if stored R² is missing
+                if _r2_stored is None:
+                    _rmse, _r2_live, _mae = _eval_on_obs(_m, _f, _t)
+                    if _r2_live is not None:
+                        _mets.update({"RMSE": round(_rmse, 3),
+                                      "R2":   round(_r2_live, 3),
+                                      "MAE":  round(_mae, 3)})
+                        local_r2 = _r2_live
+                    if not silent:
+                        print(f"INFO: Local model live eval — R²={_r2_live}  RMSE={_rmse}")
+                else:
+                    local_r2 = _r2_stored
+                    if not silent:
+                        print(f"INFO: Local model stored R²={local_r2}")
 
-            if isinstance(payload, dict):
-                sel_feats   = payload["features"]
-                target_mode_loaded = payload.get("target", "absolute")
+                if local_r2 is not None and local_r2 >= R2_MIN_THRESHOLD:
+                    model_lgb, sel_feats, metrics = _m, _f, _mets
+                    if not silent:
+                        print(f"INFO: Local model accepted (R²={local_r2:.3f} ≥ {R2_MIN_THRESHOLD}).")
+                else:
+                    if not silent:
+                        print(f"WARNING: Local model rejected "
+                              f"(R²={local_r2 if local_r2 is not None else 'unknown'} "
+                              f"< {R2_MIN_THRESHOLD}) — will check global.")
+
+        elif not force_retrain and not silent:
+            print(f"INFO: No local pre-trained model found at {model_path}")
+
+        # ------------------------------------------------------------------
+        # Step 2 — global pre-trained model (check before training anything)
+        # ------------------------------------------------------------------
+        GLOBAL_TAG          = "global"
+        # Preferred path: species-specific named model e.g. global_no2_model.joblib
+        _glob_named_path    = os.path.join(MODELS_LOCAL_DIR, f"global_{spec}_model.joblib")
+        _glob_named_feats   = os.path.join(MODELS_LOCAL_DIR, f"global_{spec}_model_features.pkl")
+        _glob_named_metrics = os.path.join(MODELS_LOCAL_DIR, f"global_{spec}_model_metrics.json")
+        # Fallback: standard naming from train_global_model()
+        _glob_std_path      = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_basic.joblib")
+        _glob_std_feats     = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_features_basic.pkl")
+        _glob_std_metrics   = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_metrics.json")
+
+        # Pick whichever global file exists (named preferred)
+        if os.path.exists(_glob_named_path) and os.path.exists(_glob_named_feats):
+            _gpath, _gfpath, _gmpath = _glob_named_path, _glob_named_feats, _glob_named_metrics
+            _glabel = f"global_pretrained ({os.path.basename(_glob_named_path)})"
+        elif os.path.exists(_glob_std_path) and os.path.exists(_glob_std_feats):
+            _gpath, _gfpath, _gmpath = _glob_std_path, _glob_std_feats, _glob_std_metrics
+            _glabel = f"global_standard ({os.path.basename(_glob_std_path)})"
+        else:
+            _gpath = None
+
+        global_model_lgb = None
+        global_sel_feats = None
+        global_target    = "absolute"
+        global_r2        = None
+        global_metrics   = {}
+
+        if _gpath is not None:
+            if not silent:
+                print(f"INFO: Found global model → {_gpath}")
+            _gm, _gf, _gt, _gr2_stored, _gmets = _load_and_eval(
+                _gpath, _gfpath, _gmpath, label=_glabel)
+            if _gm is not None:
+                global_model_lgb = _gm
+                global_sel_feats = _gf
+                global_target    = _gt
+                global_metrics   = _gmets
+                # Always evaluate live so we compare on the same data
+                _g_rmse, _g_r2_live, _g_mae = _eval_on_obs(_gm, _gf, _gt)
+                if _g_r2_live is not None:
+                    global_r2 = _g_r2_live
+                    global_metrics.update({"RMSE": round(_g_rmse, 3),
+                                           "R2":   round(_g_r2_live, 3),
+                                           "MAE":  round(_g_mae, 3)})
+                    if not silent:
+                        print(f"INFO: Global model live eval — R²={_g_r2_live:.3f}  RMSE={_g_rmse:.3f}")
+                else:
+                    global_r2 = _gr2_stored
+                    if not silent:
+                        print(f"INFO: Global model stored R²={_gr2_stored}")
+
+        # Decide: switch to global?
+        if global_model_lgb is not None:
+            _use_global = (
+                model_lgb is None                         # no local model
+                or local_r2 is None                       # local R² unknown
+                or local_r2 < R2_MIN_THRESHOLD            # local is poor
+                or (global_r2 is not None and global_r2 > (local_r2 or -np.inf))
+            )
+            if _use_global:
+                reason = (
+                    "no local model" if model_lgb is None
+                    else f"local R²={local_r2:.3f} < {R2_MIN_THRESHOLD}" if (local_r2 is not None and local_r2 < R2_MIN_THRESHOLD)
+                    else f"global R²={global_r2:.3f} > local R²={local_r2:.3f}" if global_r2 is not None
+                    else "local R² unknown"
+                )
+                if not silent:
+                    print(f"INFO: Using global model ({reason}).")
+                model_lgb  = global_model_lgb
+                sel_feats  = global_sel_feats
+                metrics    = global_metrics
             else:
-                sel_feats   = payload
-                target_mode_loaded = "absolute"
-            metrics = {"source": "local", "target": target_mode_loaded}
-            if os.path.exists(metrics_path):
+                if not silent:
+                    print(f"INFO: Keeping local model "
+                          f"(local R²={local_r2:.3f} ≥ {R2_MIN_THRESHOLD} "
+                          f"and ≥ global R²={global_r2}).")
+
+        # ------------------------------------------------------------------
+        # Step 3 — S3 site-specific model (only if still no model)
+        # ------------------------------------------------------------------
+        if model_lgb is None and not force_retrain:
+            if not silent:
+                print(f"INFO: No local/global model — checking S3 for site-specific model…")
+            _s3m, _s3pay, _s3mets = _try_load_model_from_s3(
+                loc_clean, spec, s3_manager, silent=silent)
+            if _s3m is not None:
+                _s3f  = _s3pay["features"] if isinstance(_s3pay, dict) else _s3pay
+                _s3t  = _s3pay.get("target", "absolute") if isinstance(_s3pay, dict) else "absolute"
+                _s3rm, _s3r2, _s3ma = _eval_on_obs(_s3m, _s3f, _s3t)
+                if not silent:
+                    print(f"INFO: S3 site model eval — R²={_s3r2}  RMSE={_s3rm}")
+                if _s3r2 is not None and _s3r2 >= R2_MIN_THRESHOLD:
+                    model_lgb = _s3m
+                    sel_feats = _s3f
+                    metrics   = {"source": "s3", "target": _s3t,
+                                 "RMSE": round(_s3rm, 3), "R2": round(_s3r2, 3),
+                                 "MAE":  round(_s3ma, 3)}
+                    if _s3mets:
+                        metrics.update({k: _s3mets.get(k)
+                                        for k in ("n_train", "trained_at")})
+                    if not silent:
+                        print(f"INFO: S3 site model accepted (R²={_s3r2:.3f}).")
+                else:
+                    if not silent:
+                        print(f"WARNING: S3 site model rejected (R²={_s3r2}).")
+
+        # ------------------------------------------------------------------
+        # Step 4 — S3 global model (only if still no model)
+        # ------------------------------------------------------------------
+        if model_lgb is None and not force_retrain:
+            if not silent:
+                print(f"INFO: Checking S3 for global model…")
+            os.makedirs(MODELS_LOCAL_DIR, exist_ok=True)
+            for _s3_key, _local_dst, _s3_fkey, _local_fdst in [
+                (f"{S3_MODELS_PREFIX}/global_{spec}_model.joblib",
+                 _glob_named_path,
+                 f"{S3_MODELS_PREFIX}/global_{spec}_model_features.pkl",
+                 _glob_named_feats),
+                (f"{S3_MODELS_PREFIX}/lgbm_{GLOBAL_TAG}_{spec}_basic.joblib",
+                 _glob_std_path,
+                 f"{S3_MODELS_PREFIX}/lgbm_{GLOBAL_TAG}_{spec}_features_basic.pkl",
+                 _glob_std_feats),
+            ]:
+                if model_lgb is not None:
+                    break
                 try:
-                    import json as _json
-                    with open(metrics_path) as _f:
-                        persisted = _json.load(_f)
-                    metrics.update({k: persisted.get(k) for k in ("RMSE", "R2", "MAE", "n_train", "trained_at")})
+                    _got_m = s3_manager.download_file(_s3_key,  _local_dst)
+                    _got_f = s3_manager.download_file(_s3_fkey, _local_fdst)
+                    if _got_m and _got_f:
+                        _gm2, _gf2, _gt2, _, _ = _load_and_eval(
+                            _local_dst, _local_fdst, label="s3_global")
+                        if _gm2 is not None:
+                            _gr2, _gr2v, _gma = _eval_on_obs(_gm2, _gf2, _gt2)
+                            if not silent:
+                                print(f"INFO: S3 global model eval — R²={_gr2v}  RMSE={_gr2}")
+                            model_lgb = _gm2
+                            sel_feats = _gf2
+                            metrics   = {"source": "s3_global", "target": _gt2,
+                                         "RMSE": round(_gr2, 3) if _gr2 is not None else None,
+                                         "R2":   round(_gr2v, 3) if _gr2v is not None else None,
+                                         "MAE":  round(_gma, 3) if _gma is not None else None}
                 except Exception:
                     pass
 
-        elif not force_retrain:
-            if not silent:
-                print(f"INFO: Local model not found — checking S3…")
-            model_lgb, payload, persisted_metrics = _try_load_model_from_s3(
-                loc_clean, spec, s3_manager, silent=silent
-            )
-            if model_lgb is not None:
-                if isinstance(payload, dict):
-                    sel_feats          = payload["features"]
-                    target_mode_loaded = payload.get("target", "absolute")
-                else:
-                    sel_feats          = payload
-                    target_mode_loaded = "absolute"
-                metrics = {"source": "s3", "target": target_mode_loaded}
-                if persisted_metrics:
-                    metrics.update({k: persisted_metrics.get(k) for k in ("RMSE", "R2", "MAE", "n_train", "trained_at")})
-
-
-        if model_lgb is not None and metrics.get("RMSE") is None:
-            try:
-                merged_eval = (
-                    geos_data.merge(obs_data[["time", "value"]], on="time", how="inner")
-                             .dropna(subset=["value"])
-                )
-                if len(merged_eval) >= 10:
-                    # Apply feature engineering as training
-                    merged_eval = _add_atmospheric_features(merged_eval, spec=spec)
-                    eval_df = funcs.clean_feature_names(merged_eval.copy())
-
-                    def _clean_feat(name: str) -> str:
-                        tmp = pd.DataFrame(columns=[name])
-                        return funcs.clean_feature_names(tmp).columns[0]
-
-                    feats_clean = [_clean_feat(f) for f in sel_feats]
-                    feats_avail = [f for f in feats_clean if f in eval_df.columns]
-                    eval_X = eval_df[feats_avail].ffill().bfill().fillna(eval_df[feats_avail].median())
-                    model_features = list(model_lgb.feature_name_)
-                    for feat in model_features:
-                        if feat not in eval_X.columns:
-                            eval_X[feat] = 0.0
-                    eval_X = eval_X[model_features]
-                    eval_y = merged_eval["value"].values
-
-                    raw_col_clean = _clean_feat(spec)
-                    if metrics.get("target") == "ratio" and raw_col_clean in eval_df.columns:
-                        raw_vals   = eval_df[raw_col_clean].values
-                        ratios     = model_lgb.predict(eval_X)
-                        eval_preds = raw_vals * np.clip(ratios, 0.1, 10.0)
-                    else:
-                        eval_preds = model_lgb.predict(eval_X)
-
-                    metrics.update({
-                        "RMSE": round(np.sqrt(mean_squared_error(eval_y, eval_preds)), 2),
-                        "R2":   round(r2_score(eval_y, eval_preds), 2),
-                        "MAE":  round(mean_absolute_error(eval_y, eval_preds), 2),
-                    })
-                    if not silent:
-                        print(f"INFO: Eval metrics (n={len(merged_eval)}) — "
-                              f"RMSE={metrics['RMSE']}  R2={metrics['R2']}  MAE={metrics['MAE']}")
-                else:
-                    metrics.update({"RMSE": None, "R2": None, "MAE": None})
-                    if not silent:
-                        print(f"INFO: Too few obs/GEOS overlap rows ({len(merged_eval)}) to compute metrics")
-            except Exception as exc:
-                metrics.update({"RMSE": None, "R2": None, "MAE": None})
-                if not silent:
-                    print(f"WARNING: Could not compute eval metrics: {exc}")
-
-        # Train 
-        if model_lgb is None:
+        # ------------------------------------------------------------------
+        # Step 5 — Train a new local model (LAST RESORT)
+        # ------------------------------------------------------------------
             if not silent:
                 print(f"INFO: Training new model for {loc}…")
 
@@ -1475,17 +1654,98 @@ def get_localised_forecast(
                       f"R²={cv_r2}±{np.std(fold_r2s):.3f}  "
                       f"MAE={cv_mae}±{np.std(fold_maes):.3f}")
 
+            # ── Quality gate: if CV R² is below threshold, try to improve ──
+            R2_MIN_THRESHOLD = 0.50
+            if cv_r2 < R2_MIN_THRESHOLD:
+                if not silent:
+                    print(f"WARNING: CV R²={cv_r2:.3f} < {R2_MIN_THRESHOLD} — "
+                          f"attempting improved hyperparameter search …")
+                # Try stronger regularisation and deeper trees
+                best_r2   = cv_r2
+                best_Xall = X_all
+                best_yall = y_all
+                best_cfg  = None
+
+                _search_cfgs = [
+                    dict(n_estimators=800, max_depth=7, learning_rate=0.02,
+                         num_leaves=63, subsample=0.7, colsample_bytree=0.7,
+                         min_child_samples=30, reg_alpha=0.3, reg_lambda=0.3),
+                    dict(n_estimators=1000, max_depth=6, learning_rate=0.01,
+                         num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+                         min_child_samples=50, reg_alpha=0.5, reg_lambda=0.5),
+                    dict(n_estimators=600, max_depth=8, learning_rate=0.05,
+                         num_leaves=127, subsample=0.9, colsample_bytree=0.9,
+                         min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1),
+                ]
+                for _cfg in _search_cfgs:
+                    _r2s_tmp = []
+                    for _tr_i, _val_i in tscv.split(X_all):
+                        _mt = lgb.LGBMRegressor(**_cfg, verbosity=-1, random_state=42)
+                        _mt.fit(X_all.iloc[_tr_i], y_all[_tr_i],
+                                eval_set=[(X_all.iloc[_val_i], y_all[_val_i])],
+                                callbacks=[lgb.early_stopping(50, verbose=False),
+                                           lgb.log_evaluation(-1)])
+                        _pv = _mt.predict(X_all.iloc[_val_i])
+                        if target_mode == "ratio" and raw_col in merged_train.columns:
+                            _rv = merged_train[raw_col].iloc[_val_i].values
+                            _vy = merged_train["value"].iloc[_val_i].values
+                            _pv_obs = _rv * np.clip(_pv, 0.05, 20.0)
+                        else:
+                            _vy, _pv_obs = y_all[_val_i], _pv
+                        _r2s_tmp.append(r2_score(_vy, _pv_obs))
+                    _mean_r2 = float(np.mean(_r2s_tmp))
+                    if _mean_r2 > best_r2:
+                        best_r2  = _mean_r2
+                        best_cfg = _cfg
+                        if not silent:
+                            print(f"  Improved R²={best_r2:.3f} with cfg={_cfg}")
+
+                if best_cfg is not None:
+                    # Re-run full CV with the best config to get consistent metrics
+                    fold_rmses2, fold_r2s2, fold_maes2 = [], [], []
+                    for _tr_i, _val_i in tscv.split(X_all):
+                        _mt = lgb.LGBMRegressor(**best_cfg, verbosity=-1, random_state=42)
+                        _mt.fit(X_all.iloc[_tr_i], y_all[_tr_i],
+                                eval_set=[(X_all.iloc[_val_i], y_all[_val_i])],
+                                callbacks=[lgb.early_stopping(50, verbose=False),
+                                           lgb.log_evaluation(-1)])
+                        _pv = _mt.predict(X_all.iloc[_val_i])
+                        if target_mode == "ratio" and raw_col in merged_train.columns:
+                            _rv = merged_train[raw_col].iloc[_val_i].values
+                            _vy = merged_train["value"].iloc[_val_i].values
+                            _pv_obs = _rv * np.clip(_pv, 0.05, 20.0)
+                        else:
+                            _vy, _pv_obs = y_all[_val_i], _pv
+                        fold_rmses2.append(np.sqrt(mean_squared_error(_vy, _pv_obs)))
+                        fold_r2s2.append(r2_score(_vy, _pv_obs))
+                        fold_maes2.append(mean_absolute_error(_vy, _pv_obs))
+                    cv_rmse = round(float(np.mean(fold_rmses2)), 3)
+                    cv_r2   = round(float(np.mean(fold_r2s2)),   3)
+                    cv_mae  = round(float(np.mean(fold_maes2)),  3)
+                    if not silent:
+                        print(f"INFO: Best CV after search → R²={cv_r2}  RMSE={cv_rmse}  MAE={cv_mae}")
+                    # Store best config for final model below
+                    _final_lgb_params = best_cfg
+                else:
+                    _final_lgb_params = None
+            else:
+                _final_lgb_params = None
+
             # Final model
             if not silent:
                 print(f"INFO: Fitting final model on all {len(X_all)} samples…")
 
-            model_lgb = lgb.LGBMRegressor(
+            _base_params = dict(
                 n_estimators=500, max_depth=5,
                 learning_rate=0.03, num_leaves=31,
                 subsample=0.8, colsample_bytree=0.8,
                 min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1,
                 verbosity=-1, random_state=42,
             )
+            if _final_lgb_params:
+                _base_params.update(_final_lgb_params)
+
+            model_lgb = lgb.LGBMRegressor(**_base_params)
             model_lgb.fit(X_all, y_all)
 
             # In-sample obs-space R² for sanity check
@@ -1516,8 +1776,33 @@ def get_localised_forecast(
                 print(f"INFO: Final Train R²={metrics['Train_R2']}  "
                       f"CV R²={cv_r2}  CV RMSE={cv_rmse}  target={target_mode}")
 
-            _save_model(model_lgb, sel_feats, loc_clean, spec,
-                        s3_manager, silent=silent, target_mode=target_mode, metrics=metrics)
+            # Only persist model if it meets the quality threshold
+            if cv_r2 >= R2_MIN_THRESHOLD:
+                _save_model(model_lgb, sel_feats, loc_clean, spec,
+                            s3_manager, silent=silent, target_mode=target_mode, metrics=metrics)
+            else:
+                if not silent:
+                    print(f"WARNING: Freshly trained local model still has CV R²={cv_r2:.3f} < "
+                          f"{R2_MIN_THRESHOLD} — will attempt global model fallback, "
+                          f"NOT saving this model.")
+                # Mark model_lgb as None so global fallback takes over below
+                model_lgb = None
+
+        # ------------------------------------------------------------------
+        # Final safety net: if model_lgb is still None after training,
+        # re-run the global model lookup one more time (named path only)
+        # ------------------------------------------------------------------
+        if model_lgb is None:
+            if _gpath is not None and global_model_lgb is not None:
+                # Global model was loaded earlier — use it unconditionally now
+                if not silent:
+                    print(f"INFO: Using global model as final fallback after training failure.")
+                model_lgb = global_model_lgb
+                sel_feats = global_sel_feats
+                metrics   = global_metrics
+            else:
+                print(f"ERROR: All model strategies exhausted for {loc} — cannot produce forecast.")
+                return None, None, None
 
         # Predict
         if not silent:
@@ -1611,6 +1896,7 @@ def get_localised_forecast(
                     print(f"INFO: Interpolated {filled} missing localised values")
 
         # Merge
+        print(obs_data)
         result = all_geos.merge(obs_data[["time", "value"]], on="time", how="left")
         if not silent:
             n_obs = result["value"].notna().sum()
@@ -2225,14 +2511,14 @@ def get_localised_forecast_v2(
         # Combine V1 + V2
         frames = []
         if geos_v1 is not None and not geos_v1.empty:
-            geos_v1["time"] = pd.to_datetime(geos_v1["time"]).dt.floor("H")
+            geos_v1["time"] = _normalize_time(geos_v1["time"])
             frames.append(geos_v1)
             if not silent:
                 print(f"✓ V1: {len(geos_v1)} rows "
                       f"({geos_v1['time'].min()} → {geos_v1['time'].max()})")
         
         if geos_v2 is not None and not geos_v2.empty:
-            geos_v2["time"] = pd.to_datetime(geos_v2["time"]).dt.floor("H")
+            geos_v2["time"] = _normalize_time(geos_v2["time"])
             frames.append(geos_v2)
             if not silent:
                 print(f"✓ V2: {len(geos_v2)} rows "

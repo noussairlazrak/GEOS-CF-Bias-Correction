@@ -203,7 +203,9 @@ def read_pandora(
     df = df.iloc[:, :69]
     df.columns = range(df.shape[1])
 
-    df['time'] = pd.to_datetime(df[0], format="%Y%m%dT%H%M%S.%fZ")
+    df["time"] = (
+    pd.to_datetime(df[0], format="mixed", utc=True, errors="coerce")
+      .dt.strftime("%Y%m%dT%H%M%SZ"))
 
     # ------------------------------------------------------------------ NO2 --
     if pollutant.lower() == 'no2':
