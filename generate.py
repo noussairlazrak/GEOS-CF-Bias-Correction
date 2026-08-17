@@ -32,6 +32,8 @@ parser.add_argument('--force-source', nargs='+', default=[], metavar='SOURCE',
 parser.add_argument('--skip-source', nargs='+', default=[], metavar='SOURCE',
                     help='Skip one or more observation sources entirely (e.g. --skip-source DoS_Missions REMMAQ)')
 parser.add_argument('--stale-hours', type=int, default=48, help='Hours threshold for considering files stale (default: 48)')
+parser.add_argument('--locations', type=str, default=None, metavar='LOCATIONS',
+                    help='Run forecasts for specific locations. Can be: comma-separated names (e.g. "Agam,Beijing-RADI,Tokyo-Sophia") or path to file with location names (one per line)')
 args = parser.parse_args()
 
 # Config
@@ -47,6 +49,20 @@ STALE_HOURS = args.stale_hours
 FORCE_UPDATE = args.force_update
 FORCE_SOURCES = [s.strip() for s in args.force_source]  
 SKIP_SOURCES  = [s.strip() for s in args.skip_source]   
+
+# Parse location filter
+LOCATION_FILTER = None
+if args.locations:
+    if os.path.isfile(args.locations):
+        # Read from file
+        with open(args.locations, 'r') as f:
+            LOCATION_FILTER = set(line.strip() for line in f if line.strip())
+        print(f"Location filter loaded from file: {len(LOCATION_FILTER)} locations")
+    else:
+        # Parse comma-separated list
+        LOCATION_FILTER = set(loc.strip() for loc in args.locations.split(',') if loc.strip())
+        print(f"Location filter from argument: {len(LOCATION_FILTER)} locations")
+   
 
 # Cache
 MODEL_CACHE_SOURCE = args.model_cache
@@ -92,7 +108,10 @@ if CLEAN_LOCAL:
 
 # Locations
 url = "https://raw.githubusercontent.com/noussairlazrak/MLpred/refs/heads/main/global.json"
-print(f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}, STALE_HOURS={STALE_HOURS}, FORCE_SOURCES={FORCE_SOURCES}, SKIP_SOURCES={SKIP_SOURCES}")
+config_msg = f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}, STALE_HOURS={STALE_HOURS}, FORCE_SOURCES={FORCE_SOURCES}, SKIP_SOURCES={SKIP_SOURCES}"
+if LOCATION_FILTER:
+    config_msg += f", LOCATION_FILTER={len(LOCATION_FILTER)} locations"
+print(config_msg)
 data = json.loads(requests.get(url, stream=True).text)
 all_locations = [] 
 
@@ -117,7 +136,6 @@ for key, location_data in list(data.items()):
     if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "REMMAQ"):
         obs_source = location_data["observation_source"]
 
-
         if SKIP_SOURCES and obs_source in SKIP_SOURCES:
             print(f"Skipping {obs_source} (--skip-source)")
             continue
@@ -126,6 +144,11 @@ for key, location_data in list(data.items()):
         locname = location_data["location_name"]
         lat = location_data["lat"]
         lon = location_data["lon"]
+        
+        # Apply location filter
+        if LOCATION_FILTER and locname not in LOCATION_FILTER:
+            continue
+        
         print(f"\nProcessing: {locname} (lat: {lat}, lon: {lon})")
 
         force_this = FORCE_UPDATE or (obs_source in FORCE_SOURCES)
@@ -302,6 +325,9 @@ for key, location_data in list(data.items()):
                 # Clip negatives
                 num_cols = fcast.select_dtypes(include=["float", "int"]).columns
                 fcast[num_cols] = fcast[num_cols].clip(lower=0)
+                
+                mask = fcast['corrected'] > fcast[col_name].max()
+                fcast.loc[mask, 'corrected'] = fcast.loc[mask, 'no2']
 
                 # corrected is at least 0.1
                 if "corrected" in fcast.columns:

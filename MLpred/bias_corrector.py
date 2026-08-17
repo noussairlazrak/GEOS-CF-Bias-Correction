@@ -5,16 +5,6 @@ bias_corrector.py
 Localised bias-correction forecasts using LightGBM trained on
 Pandora (or other) observations merged with GEOS-CF V1 (historical replay)
 and V2 (recent analysis + 5-day forecast).
-
-Key features
-------------
-* Observations are loaded via ``read_pandora`` with local caching so that
-  repeated calls for the same site do not re-download the full file.
-* Pre-trained models are looked up first from the local ``MODELS/`` folder,
-  then from S3 (``snwg_forecast_working_files/MODELS/``), so forecast
-  generation is fast after the first run.
-* GEOS-CF V1 (replay) is used for training; V2 provides the most-recent
-  analysis window and the 5-day forecast horizon.
 """
 
 import sys
