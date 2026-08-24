@@ -8,6 +8,7 @@ from MLpred import funcs
 from MLpred.bias_corrector import get_localised_forecast
 from MLpred.s3_manager import S3Manager
 from MLpred.geos_fp_cnn import read_geos_fp_cnn, load_geojson_all_locations
+from MLpred.alerts import alert_read_failure, alert_no_new_data
 import datetime as dt
 import pandas as pd
 import numpy as np
@@ -130,6 +131,11 @@ for _day_offset in (0, 1):
         break
 else:
     print("No GEOS-FP GeoJSON found")
+    alert_no_new_data(
+        "load_geojson_all_locations", "all DoS_Missions locations",
+        reason="No GEOS-FP GeoJSON available for current day or -1 day; "
+               "PM2.5 forecasts will be skipped this run.",
+    )
 
 # Forecasts
 for key, location_data in list(data.items()):
@@ -221,6 +227,7 @@ for key, location_data in list(data.items()):
             except Exception as e:
                 print(f"Error processing merra2 for {key}: {e}")
                 traceback.print_exc()
+                alert_read_failure("read_geos_fp_cnn", locname, e, lat=lat, lon=lon)
             
         if location_data["observation_source"] in ("NASA Pandora", "REMMAQ"):
             # Paths
@@ -311,6 +318,12 @@ for key, location_data in list(data.items()):
                 )
                 if merged_data is None:
                     print(f"ERROR: Bias correction failed for {locname}")
+                    alert_no_new_data(
+                        "get_localised_forecast", locname,
+                        reason="read_pandora/read_geos_cf/read_obs returned no usable data "
+                               "(see log above for the specific ERROR line)",
+                        obs_source=obs_src, lat=lat, lon=lon,
+                    )
                     continue
                 
 
@@ -417,5 +430,9 @@ for key, location_data in list(data.items()):
             except Exception as e:
                 print(f"Error processing {source_type} for {key}: {e}")
                 traceback.print_exc()
+                alert_read_failure(
+                    "get_localised_forecast", locname, e,
+                    obs_source=obs_src, lat=lat, lon=lon,
+                )
 
 print("\nForecast generation completed.")
