@@ -3,16 +3,16 @@
 pandora.py
 
 Standalone module for reading and parsing Pandora instrument data files.
-Supports NO2 and O3 pollutants.
-
-Author: Noussair Lazrak
+Supports NO2 and O3.
 """
 
 import hashlib
+import io
 import os
 import re
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -25,6 +25,17 @@ OBS_CACHE_DIR = os.path.join(
 )
 
 DEFAULT_CACHE_HOURS: int = 24
+
+PANDORA_API_BASE: str = "https://api.pandonia-global-network.org"
+
+
+_PANDORA_EPOCH = datetime(2010, 1, 1)
+
+_PANDORA_FILENAME_RE = re.compile(
+    r'Pandora(?P<pan_id>\d+)s(?P<spectrometer>\d+)_(?P<location>.+)_L2_'
+    r'(?P<code>[a-z]{4}\d)(?P<blickp>p\d+-\d+)\.txt$',
+    re.IGNORECASE,
+)
 
 
 def _site_from_url(url: str) -> str:
@@ -45,6 +56,30 @@ def _site_from_url(url: str) -> str:
     except Exception:
         pass
     return hashlib.md5(url.encode()).hexdigest()[:10]
+
+
+def _pandora_bulk_l2_url(
+    url: str,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> str:
+    match = _PANDORA_FILENAME_RE.search(url)
+    if not match:
+        raise ValueError(
+            f"Could not parse Pandora instrument/spectrometer/location/code "
+            f"from '{url}'. Expected a filename matching "
+            f"'Pandora<N>s<S>_<Location>_L2_<code><blickp>.txt'."
+        )
+    params = {
+        "start_datetime": (start or _PANDORA_EPOCH).strftime("%Y-%m-%dT%H:%M:%S"),
+        "end_datetime": (end or datetime.utcnow()).strftime("%Y-%m-%dT%H:%M:%S"),
+        "pan_id": match.group("pan_id"),
+        "spectrometer": match.group("spectrometer"),
+        "location": match.group("location"),
+        "code": match.group("code"),
+        "blickp_version": match.group("blickp"),
+    }
+    return f"{PANDORA_API_BASE}/v1/download/bulk_l2?{urlencode(params)}"
 
 
 def _cache_path(pollutant: str, location: Optional[str] = None, url: Optional[str] = None) -> str:
@@ -129,49 +164,10 @@ def read_pandora(
     cache: bool = True,
     cache_hours: int = DEFAULT_CACHE_HOURS,
     silent: bool = False,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
 ) -> pd.DataFrame:
-    """
-    Fetch and parse a Pandora instrument data file.
 
-    The function downloads the file at *url*, strips the header, and
-    extracts per-measurement columns for the requested *pollutant*.
-    Filtering for quality / physical-range constraints is applied
-    automatically.
-
-    A local CSV cache is maintained under ``OBS_CACHE_DIR``.  If the cached
-    file is younger than *cache_hours* it is returned directly without
-    hitting the remote server.
-
-    Parameters
-    ----------
-    url : str
-        Direct URL to the Pandora ASCII data file.
-    pollutant : {'no2', 'o3'}
-        Pollutant to extract.  Defaults to ``'no2'``.
-    cache : bool
-        Enable local caching (default: ``True``).
-    cache_hours : int
-        Age threshold in hours below which the local cache is considered
-        fresh (default: ``24``).
-    silent : bool
-        Suppress cache-related print messages (default: ``False``).
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: ``time``, ``lat``, ``lon``, ``value``, ``location``.
-
-        * For NO2: ``value`` is in ppbv (scaled by 1/40 after unit
-          conversion).
-        * For O3:  ``value`` is the total column in Dobson Units.
-
-    Raises
-    ------
-    ValueError
-        If *pollutant* is not ``'no2'`` or ``'o3'``.
-    requests.HTTPError
-        If the remote file cannot be downloaded.
-    """
     cache_file = _cache_path(pollutant, url=url)
 
     if cache and _is_cache_fresh(cache_file, cache_hours):
@@ -183,18 +179,20 @@ def read_pandora(
     if not silent:
         print(f"Downloading {pollutant.upper()} data for '{_site_from_url(url)}'")
 
-    response = requests.get(url)
+    api_url = _pandora_bulk_l2_url(url, start=start, end=end)
+    response = requests.get(api_url)
     response.raise_for_status()
     content = response.text
 
     metadata = extract_metadata(content)
 
     separator = "---------------------------------------------------------------------------------------"
-    data_start_index = content.index(separator) + len(separator)
+
+    data_start_line = content[:content.rindex(separator)].count("\n") + 1
 
     df = pd.read_csv(
-        url,
-        skiprows=data_start_index,
+        io.StringIO(content),
+        skiprows=data_start_line,
         header=None,
         sep=r'\s+',
         encoding='ISO-8859-1',
