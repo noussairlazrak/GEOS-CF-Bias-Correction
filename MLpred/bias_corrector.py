@@ -40,6 +40,7 @@ if _REPO_ROOT not in sys.path:
 from MLpred import mlpred
 from MLpred import funcs
 from MLpred.pandora import read_pandora, _cache_path, _is_cache_fresh, DEFAULT_CACHE_HOURS, OBS_CACHE_DIR
+from MLpred.read_geos_cf import read_geos_cf
 from MLpred.s3_manager import S3Manager
 
 # ---------------------------------------------------------------------------
@@ -288,9 +289,9 @@ def train_global_model(
                 continue
 
             # GEOS-CF V1 + V2
-            geos_v1 = mlpred.read_geos_cf(lon=lon, lat=lat, start=st, end=ed,
+            geos_v1 = read_geos_cf(lon=lon, lat=lat, start=st, end=ed,
                                            version=1, verbose=False)
-            geos_v2 = mlpred.read_geos_cf(
+            geos_v2 = read_geos_cf(
                 lon=lon, lat=lat,
                 start=st,
                 end=datetime.now() + timedelta(days=5),
@@ -313,6 +314,12 @@ def train_global_model(
                 .reset_index(drop=True)
             )
 
+            # Feature engineering on the full, continuous hourly series —
+            # lag/rolling features must be computed here (not after merging
+            # with sparse obs) so they carry the same meaning as at
+            # prediction time in get_localised_forecast.
+            geos_data = _add_atmospheric_features(geos_data, spec=spec)
+
             # Merge obs + GEOS-CF
             merged = (
                 geos_data.merge(obs_data[["time", "value"]], on="time", how="inner")
@@ -322,9 +329,6 @@ def train_global_model(
                 print(f"    WARNING: Only {len(merged)} overlap rows — skipping {loc}.")
                 per_site_log.append({"loc": loc, "status": "too_few_rows", "n_rows": len(merged)})
                 continue
-
-            # Feature engineering
-            merged = _add_atmospheric_features(merged, spec=spec)
 
             # Bias ratio target (same logic as per-site training)
             raw_col = spec
@@ -718,6 +722,11 @@ def train_global_model_from_local(
                 del obs
                 continue
 
+            # Feature engineering on the full, continuous hourly series —
+            # must happen BEFORE merging with sparse obs so lag/rolling
+            # features carry the same meaning as at prediction time.
+            geos_data = _add_atmospheric_features(geos_data, spec=spec)
+
             # Merge obs onto GEOS-CF — keep only needed columns to limit RAM
             merged = (
                 geos_data[
@@ -733,8 +742,6 @@ def train_global_model_from_local(
                 skipped += 1
                 del merged
                 continue
-
-            merged = _add_atmospheric_features(merged, spec=spec)
 
             # Bias-ratio target
             raw_col = spec
@@ -990,6 +997,16 @@ def _load_observations(obs_src: str, obs_url: str,
     df["time"] = _normalize_time(df["time"])
     return df
 
+def _format_metrics_summary(metrics: dict) -> str:
+    """One-line, human-readable summary of a model metrics dict for logging."""
+    if not metrics:
+        return "no metrics available"
+    keys = ("source", "target", "R2", "RMSE", "MAE",
+            "CV_R2", "CV_RMSE", "CV_MAE", "Train_R2", "n_train", "trained_at")
+    bits = [f"{k}={metrics[k]}" for k in keys if metrics.get(k) is not None]
+    return ", ".join(bits) if bits else "no metrics available"
+
+
 def _normalize_time(series):
     """
     Convert mixed datetime strings to UTC, floor to hour,
@@ -1207,13 +1224,13 @@ def get_localised_forecast(
         # GEOS-CF V1
         if not silent:
             print(f"INFO: Loading GEOS-CF V1 (replay)…")
-        geos_v1 = mlpred.read_geos_cf(lon=lon, lat=lat, start=st, end=ed,
+        geos_v1 = read_geos_cf(lon=lon, lat=lat, start=st, end=ed,
                                        version=1, verbose=not silent)
 
         # GEOS-CF V2 
         if not silent:
             print(f"INFO: Loading GEOS-CF V2 (analysis + forecast)…")
-        geos_v2 = mlpred.read_geos_cf(
+        geos_v2 = read_geos_cf(
             lon=lon, lat=lat,
             start=st,
             end=datetime.now() + timedelta(days=5),
@@ -1249,6 +1266,14 @@ def get_localised_forecast(
         if not silent:
             print(f"INFO: Combined GEOS-CF → {len(geos_data)} rows "
                   f"({geos_data['time'].min()} → {geos_data['time'].max()})")
+
+        # Engineer atmospheric/lag/rolling features on the FULL, continuous
+        # hourly GEOS-CF series (not on the sparse obs-merged subset used
+        # for training). This keeps lag/rolling features consistent between
+        # training and prediction — otherwise "lag1h" means "1 hour ago" at
+        # prediction time but "previous available observation" (which can
+        # be hours or days earlier for sparse Pandora obs) at training time.
+        geos_data_feat = _add_atmospheric_features(geos_data, spec=spec)
 
         # ==================================================================
         # Model selection — priority order:
@@ -1301,11 +1326,10 @@ def get_localised_forecast(
             Evaluate model *m* against obs/GEOS overlap. Returns (rmse, r2, mae).
             """
             try:
-                _ev = (geos_data.merge(obs_data[["time", "value"]], on="time", how="inner")
+                _ev = (geos_data_feat.merge(obs_data[["time", "value"]], on="time", how="inner")
                                 .dropna(subset=["value"]))
                 if len(_ev) < 10:
                     return None, None, None
-                _ev = _add_atmospheric_features(_ev, spec=spec)
                 _edf = funcs.clean_feature_names(_ev.copy())
 
                 def _cf(n):
@@ -1520,12 +1544,13 @@ def get_localised_forecast(
         # ------------------------------------------------------------------
         # Step 5 — Train a new local model (LAST RESORT)
         # ------------------------------------------------------------------
+        if model_lgb is None:
             if not silent:
                 print(f"INFO: Training new model for {loc}…")
 
             merged_train = (
-                geos_data.merge(obs_data[["time", "value"]], on="time", how="inner")
-                         .dropna(subset=["value"])
+                geos_data_feat.merge(obs_data[["time", "value"]], on="time", how="inner")
+                              .dropna(subset=["value"])
             )
 
             if not silent:
@@ -1535,8 +1560,7 @@ def get_localised_forecast(
                 print(f"ERROR: Insufficient training data ({len(merged_train)} samples)")
                 return None, None, None
 
-            # Features
-            merged_train = _add_atmospheric_features(merged_train, spec=spec)
+            # Features (already engineered on the full geos_data_feat above)
             if not silent:
                 new_feat_count = len([c for c in merged_train.columns
                                       if c not in geos_data.columns and c != "value"])
@@ -1544,7 +1568,7 @@ def get_localised_forecast(
                       f"(cyclical time, atmospheric proxies, lags)")
 
             # obs / geos_raw
-        
+    
             raw_col = spec 
             if raw_col not in merged_train.columns:
 
@@ -1798,8 +1822,8 @@ def get_localised_forecast(
         if not silent:
             print(f"INFO: Predicting over {len(geos_data)} GEOS-CF rows…")
 
-
-        geos_data_feat = _add_atmospheric_features(geos_data, spec=spec)
+        # Reuse the features engineered on the full series above — do not
+        # recompute, so prediction-time lags match training-time lags.
         all_geos = funcs.clean_feature_names(geos_data_feat.copy())
 
  
@@ -1886,7 +1910,6 @@ def get_localised_forecast(
                     print(f"INFO: Interpolated {filled} missing localised values")
 
         # Merge
-        print(obs_data)
         result = all_geos.merge(obs_data[["time", "value"]], on="time", how="left")
         if not silent:
             n_obs = result["value"].notna().sum()
@@ -1896,6 +1919,9 @@ def get_localised_forecast(
 
         # Overall AQI
         result = funcs.calculate_overall_aqi(result)
+
+        print(f"INFO: Model performance for {loc} ({spec.upper()}): "
+              f"{_format_metrics_summary(metrics)}")
 
         return result, metrics, model_lgb
 
@@ -2106,11 +2132,7 @@ def train_global(
     
     gc.collect()
     
-    # ── LAG FEATURES ────────────────────────────────────────────────────────────
-    if verbose:
-        print(f"\n--- CREATING LAG FEATURES ---")
-    
-    # Sample if needed
+    # ── SAMPLING (memory control) ─────────────────────────────────────────────
     if len(df) > max_rows:
         if verbose:
             print(f"⚠️  Sampling {len(df):,} rows → {max_rows:,}")
@@ -2123,27 +2145,20 @@ def train_global(
             ).reset_index(drop=True)
         else:
             df = df.sample(n=max_rows, random_state=random_state).sort_index()
-    
-    # Create lags grouped by site
+
+    # NOTE: this used to create autoregressive lag/rolling features of the
+    # observed target_variable itself here. They were dropped:
+    #  1. They were computed sorted by ("_site", "hour") — hour-of-day, not
+    #     real time — so e.g. "lag6h" mixed in values from arbitrary
+    #     unrelated days that happened to share a nearby hour-of-day.
+    #  2. This model (global_no2_lgbm_improved.joblib) is used by
+    #     get_localised_forecast_v2 for multi-day-ahead forecasts, where no
+    #     recent observation exists to lag from. These columns don't exist
+    #     in the GEOS-CF prediction frame there and were silently zero-filled
+    #     at serve time — i.e. every live forecast told the model "the last
+    #     known concentration was 0", a large, systematic source of bias.
     lag_features = []
-    if "_site" in df.columns:
-        df = df.sort_values(["_site", "hour"]).reset_index(drop=True)
-        
-        for lag in [6, 12, 24]:
-            col_name = f'{target_variable}_lag{lag}h'
-            df[col_name] = df.groupby('_site')[target_variable].shift(lag).astype('float32')
-            lag_features.append(col_name)
-        
-        for window in [6, 12]:
-            col_name = f'{target_variable}_roll_mean_{window}h'
-            df[col_name] = df.groupby('_site')[target_variable].transform(
-                lambda x: x.rolling(window=window, min_periods=1).mean()
-            ).astype('float32')
-            lag_features.append(col_name)
-        
-        if verbose:
-            print(f"✓ Created {len(lag_features)} lag/rolling features")
-    
+
     gc.collect()
     
     # ── FEATURE FILTERING ───────────────────────────────────────────────────────
@@ -2488,12 +2503,12 @@ def get_localised_forecast_v2(
             print(f"\n--- LOADING GEOS-CF DATA ---")
         
         # V1 (replay)
-        geos_v1 = mlpred.read_geos_cf(
+        geos_v1 = read_geos_cf(
             lon=lon, lat=lat, start=st, end=ed, version=1, verbose=not silent
         )
         
         # V2 (analysis + forecast)
-        geos_v2 = mlpred.read_geos_cf(
+        geos_v2 = read_geos_cf(
             lon=lon, lat=lat, start=st, end=datetime.now() + timedelta(days=5),
             version=2, verbose=not silent
         )
@@ -2526,18 +2541,39 @@ def get_localised_forecast_v2(
         )
         if not silent:
             print(f"✓ Combined: {len(geos_data)} rows")
-        
+
         # ────────────────────────────────────────────────────────────────────
-        # STEP 3: MERGE FOR TRAINING
+        # STEP 3: ENGINEER FEATURES
+        # ────────────────────────────────────────────────────────────────────
+        # Computed on the full, continuous hourly GEOS-CF series (not on the
+        # sparse obs-merged subset) so lag/rolling features carry the same
+        # temporal meaning at training time as they do at prediction time
+        # (Pandora obs are irregular/sparse, so "lag1h" on the merged data
+        # would actually mean "previous available observation", not "1h ago").
+        if not silent:
+            print(f"\n--- ENGINEERING FEATURES ---")
+
+        geos_data_feat = _add_atmospheric_features(geos_data, spec=spec)
+
+        if not silent:
+            new_feat_count = len([c for c in geos_data_feat.columns if c not in geos_data.columns])
+            print(f"✓ Added {new_feat_count} engineered features")
+            print(f"  - Cyclical time (hour_sin/cos, doy_sin/cos)")
+            print(f"  - Lag features (lag1h, lag3h, lag6h, lag24h)")
+            print(f"  - Rolling statistics (roll3h, roll6h)")
+            print(f"  - Atmospheric proxies (pbl_proxy, t2m_delta, etc.)")
+
+        # ────────────────────────────────────────────────────────────────────
+        # STEP 4: MERGE FOR TRAINING
         # ────────────────────────────────────────────────────────────────────
         if not silent:
             print(f"\n--- MERGING OBSERVATIONS & GEOS-CF ---")
-        
+
         merged_train = (
-            geos_data.merge(obs_data[["time", "value"]], on="time", how="inner")
+            geos_data_feat.merge(obs_data[["time", "value"]], on="time", how="inner")
             .dropna(subset=["value"])
         )
-        
+
         if len(merged_train) < 50:
             print(f"WARNING: Only {len(merged_train)} training samples (need ≥50)")
             print(f"  Using global model as fallback")
@@ -2545,24 +2581,6 @@ def get_localised_forecast_v2(
         else:
             if not silent:
                 print(f"✓ Merged: {len(merged_train)} rows")
-        
-        # ────────────────────────────────────────────────────────────────────
-        # STEP 4: ADD ENGINEERED FEATURES
-        # ────────────────────────────────────────────────────────────────────
-        if merged_train is not None:
-            if not silent:
-                print(f"\n--- ENGINEERING FEATURES ---")
-            
-            merged_train = _add_atmospheric_features(merged_train, spec=spec)
-            
-            if not silent:
-                new_feat_count = len([c for c in merged_train.columns
-                                      if c not in geos_data.columns and c != "value"])
-                print(f"✓ Added {new_feat_count} engineered features")
-                print(f"  - Cyclical time (hour_sin/cos, doy_sin/cos)")
-                print(f"  - Lag features (lag1h, lag3h, lag6h, lag24h)")
-                print(f"  - Rolling statistics (roll3h, roll6h)")
-                print(f"  - Atmospheric proxies (pbl_proxy, t2m_delta, etc.)")
         
         # ────────────────────────────────────────────────────────────────────
         # STEP 5: TRAIN LOCAL MODEL
@@ -2622,14 +2640,17 @@ def get_localised_forecast_v2(
                 print(f"✓ Features: {len(sel_feats_clean)}")
                 print(f"  Training samples: {len(X_all)}")
             
-            # K-fold CV
+            # Time-series CV — NOT a shuffled K-fold: X_all carries lag/rolling
+            # features of temporally adjacent rows, so a shuffled split would
+            # leak near-duplicate autocorrelated rows across train/val and
+            # inflate R² far above real forecasting performance.
             n_splits = min(3, max(2, len(merged_train) // 300))
-            kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+            kfold = TimeSeriesSplit(n_splits=n_splits)
             cv_r2s = []
-            
+
             if not silent:
-                print(f"\n--- K-FOLD CROSS-VALIDATION ({n_splits} folds) ---")
-            
+                print(f"\n--- TIME-SERIES CROSS-VALIDATION ({n_splits} folds) ---")
+
             for fold, (tr_idx, val_idx) in enumerate(kfold.split(X_all), 1):
                 X_tr_fold, X_val_fold = X_all.iloc[tr_idx], X_all.iloc[val_idx]
                 y_tr_fold, y_val_fold = y_all[tr_idx], y_all[val_idx]
@@ -2755,8 +2776,8 @@ def get_localised_forecast_v2(
         if not silent:
             print(f"\n--- PREPARING FOR PREDICTION ---")
         
-        # Add features to full GEOS-CF dataset
-        geos_data_feat = _add_atmospheric_features(geos_data, spec=spec)
+        # Reuse the features engineered in STEP 3 above — do not recompute,
+        # so prediction-time lags match training-time lags.
         all_geos = funcs.clean_feature_names(geos_data_feat.copy())
         
         # Determine which features to use
@@ -2849,6 +2870,12 @@ def get_localised_forecast_v2(
         # ────────────────────────────────────────────────────────────────────
         # STEP 10: SUMMARY
         # ────────────────────────────────────────────────────────────────────
+        perf_bits = [f"{k}={selected_metrics[k]}" for k in
+                     ("source", "target_mode", "cv_r2", "test_r2", "test_rmse", "n_train")
+                     if selected_metrics.get(k) is not None]
+        print(f"INFO: Model performance for {loc} ({spec.upper()}): "
+              f"{', '.join(perf_bits) if perf_bits else 'no metrics available'}")
+
         if not silent:
             print(f"\n" + "="*70)
             print("FORECAST COMPLETE")
@@ -2860,7 +2887,7 @@ def get_localised_forecast_v2(
                 print(f"Model R²: {selected_metrics['cv_r2']:.4f}")
             print(f"Time range: {result['time'].min()} → {result['time'].max()}")
             print(f"="*70 + "\n")
-        
+
         return result, selected_metrics, selected_model
     
     except Exception as exc:

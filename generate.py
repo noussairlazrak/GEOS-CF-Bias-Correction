@@ -328,6 +328,13 @@ for key, location_data in list(data.items()):
                 
 
                 metadata = metrics
+                if metrics:
+                    perf_bits = [f"{k}={metrics[k]}" for k in
+                                 ("source", "target", "R2", "RMSE", "MAE",
+                                  "CV_R2", "CV_RMSE", "CV_MAE", "Train_R2", "n_train")
+                                 if metrics.get(k) is not None]
+                    print(f"Model performance for {locname}: "
+                          f"{', '.join(perf_bits) if perf_bits else 'no metrics available'}")
                 col_map = {"no2": "no2", "localised": "corrected", "value": col_name}
                 keep_cols = [c for c in ["time", "no2", "localised", "value", "o3", "pm25_rh35", "rh", "t", "tprec", "hcho"] if c in merged_data.columns]
                 fcast = merged_data[keep_cols].rename(columns=col_map).copy()
@@ -381,51 +388,61 @@ for key, location_data in list(data.items()):
                         traceback.print_exc()
 
 
-                cutoff = fcast["time"].max() - pd.DateOffset(months=12)
-                merg = fcast[fcast["time"] >= cutoff].copy()
-                merg = funcs.convert_times_column(merg, 'time', lat, lon)
+                # Two precomputed variants per location:
+                #   - "<locname>.json": last 1 month + forecast tail (the default/app view)
+                #   - "<locname>_historical.json": the full merged series (2018 -> forecast tail)
+                historical_file_path = f'./precomputed/all_dts/{locname}_historical.json'
+                historical_s3_key = f"{S3_PREFIXES['forecasts']}/{locname}_historical.json"
+                cutoff_recent = pd.Timestamp(dt.datetime.now()) - pd.DateOffset(months=1)
 
-                # NowCast
-                species_map = {'PM2.5': 'pm25_rh35', 'NO2': 'corrected', 'O3': 'o3'}
-                avg_hours = {'NO2': 3, 'O3': 1}
-                merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)
-                merg = funcs.calculate_overall_aqi(merg)
-                print(merg.columns)
+                variants = [
+                    (fcast[fcast["time"] >= cutoff_recent].copy(), file_path, s3_key, "recent (1mo + forecast)"),
+                    (fcast.copy(), historical_file_path, historical_s3_key, "full historical"),
+                ]
 
-                # Forecast
-                forecast_dict = {
-                    "location": site_settings.get("l_name", "N/A"),
-                    "lat": site_settings.get("lat", "N/A"),
-                    "lon": site_settings.get("lon", "N/A"),
-                    "species": "no2",
-                    "sources": ["geoscf", col_name],
-                    "forecasts": merg.to_dict(orient='records'),
-                    "metrics": metadata,
-                    "metadata": metadata
-                }
-                
-                # Save
-                if NO_LOCAL_SAVE:
-                    if s3_manager.upload_json(forecast_dict, s3_key):
-                        print(f"NO2 forecast for {locname} saved to S3")
+                for merg, out_path, out_s3_key, variant_label in variants:
+                    merg = funcs.convert_times_column(merg, 'time', lat, lon)
+
+                    # NowCast
+                    species_map = {'PM2.5': 'pm25_rh35', 'NO2': 'corrected', 'O3': 'o3'}
+                    avg_hours = {'NO2': 3, 'O3': 1}
+                    merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)
+                    merg = funcs.calculate_overall_aqi(merg)
+
+                    # Forecast
+                    forecast_dict = {
+                        "location": site_settings.get("l_name", "N/A"),
+                        "lat": site_settings.get("lat", "N/A"),
+                        "lon": site_settings.get("lon", "N/A"),
+                        "species": "no2",
+                        "sources": ["geoscf", col_name],
+                        "forecasts": merg.to_dict(orient='records'),
+                        "metrics": metadata,
+                        "metadata": metadata
+                    }
+
+                    # Save
+                    if NO_LOCAL_SAVE:
+                        if s3_manager.upload_json(forecast_dict, out_s3_key):
+                            print(f"NO2 forecast ({variant_label}) for {locname} saved to S3")
+                        else:
+                            print(f"Failed to save NO2 forecast ({variant_label}) for {locname}")
                     else:
-                        print(f"Failed to save NO2 forecast for {locname}")
-                else:
-                    try:
-                        with open(file_path, 'w') as f:
-                            json.dump(forecast_dict, f, indent=2, default=str)
-                        print(f"NO2 forecast for {locname} saved locally")
-                        
-                        # Upload
-                        s3_manager.upload_file(file_path, s3_key)
-                        print(f"NO2 forecast for {locname} uploaded to S3")
-                        
-                        # Cleaning
-                        if CLEAN_LOCAL:
-                            os.remove(file_path)
-                            print(f"Local file removed: {file_path}")
-                    except Exception as e:
-                        print(f"Error saving NO2 forecast for {locname}: {e}")
+                        try:
+                            with open(out_path, 'w') as f:
+                                json.dump(forecast_dict, f, indent=2, default=str)
+                            print(f"NO2 forecast ({variant_label}) for {locname} saved locally")
+
+                            # Upload
+                            s3_manager.upload_file(out_path, out_s3_key)
+                            print(f"NO2 forecast ({variant_label}) for {locname} uploaded to S3")
+
+                            # Cleaning
+                            if CLEAN_LOCAL:
+                                os.remove(out_path)
+                                print(f"Local file removed: {out_path}")
+                        except Exception as e:
+                            print(f"Error saving NO2 forecast ({variant_label}) for {locname}: {e}")
 
             except Exception as e:
                 print(f"Error processing {source_type} for {key}: {e}")

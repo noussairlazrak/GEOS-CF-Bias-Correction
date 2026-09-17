@@ -28,6 +28,14 @@ DEFAULT_CACHE_HOURS: int = 24
 
 PANDORA_API_BASE: str = "https://api.pandonia-global-network.org"
 
+#: Pandora L2 quality flags encode quality level in the units digit
+#: (0=high, 1=medium, 2=low) and assurance state in the tens digit
+#: (assured=0x, not-yet-assured/preliminary=1x). Per the Pandonia Global
+#: Network / NASA Pandora Project documentation, flags 0 and 10 are both
+#: "high quality" (assured and not-yet-assured respectively) and safe to
+#: use; 1/11 (medium) and 2/12 (low) are excluded here.
+HIGH_QUALITY_FLAGS = (0, 10)
+
 
 _PANDORA_EPOCH = datetime(2010, 1, 1)
 
@@ -158,6 +166,16 @@ def convert_no2_mol_m3_to_ppbv(
     return no2_mol_m3 * (24.45 * 1e9) / (0.0821 * temperature_k * pressure_atm)
 
 
+def _filter_high_quality(df: pd.DataFrame, flag_col: str, silent: bool = True) -> pd.DataFrame:
+    """Keep only rows whose *flag_col* is a high-quality Pandora flag (0 or 10)."""
+    flags = pd.to_numeric(df[flag_col], errors='coerce')
+    kept = df[flags.isin(HIGH_QUALITY_FLAGS)]
+    if not silent:
+        print(f"Quality filter ({flag_col}): kept {len(kept)}/{len(df)} rows "
+              f"(flags in {HIGH_QUALITY_FLAGS}).")
+    return kept
+
+
 def read_pandora(
     url: str,
     pollutant: str = 'no2',
@@ -243,6 +261,7 @@ def read_pandora(
             (result_df['value'] > 0) &
             (result_df['value'] < 100)
         ]
+        result_df = _filter_high_quality(result_df, 'quality_flag_no2', silent=silent)
 
     # ------------------------------------------------------------------ O3 ---
     elif pollutant.lower() == 'o3':
@@ -315,11 +334,11 @@ def read_pandora(
 
         result_df = result_df[
             (result_df['o3_total_column'] != -9e99) &
-            (result_df['quality_flag_o3'].isin([0, 1, 2, 10, 11, 12])) &
             (result_df['o3_total_column'] >= 0) &
             (result_df['aerosol_opt_depth_center'] >= 0) &
             (result_df['o3_total_column'] <= 500)
         ]
+        result_df = _filter_high_quality(result_df, 'quality_flag_o3', silent=silent)
 
     else:
         raise ValueError(
