@@ -35,6 +35,14 @@ parser.add_argument('--skip-source', nargs='+', default=[], metavar='SOURCE',
 parser.add_argument('--stale-hours', type=int, default=48, help='Hours threshold for considering files stale (default: 48)')
 parser.add_argument('--locations', type=str, default=None, metavar='LOCATIONS',
                     help='Run forecasts for specific locations. Can be: comma-separated names (e.g. "Agam,Beijing-RADI,Tokyo-Sophia") or path to file with location names (one per line)')
+parser.add_argument('--location-id', type=str, default=None, metavar='ID',
+                    help='Run forecast for a single location by its global.json id (e.g. 184 or -184)')
+parser.add_argument('--s3-anon', action='store_true', default=False,
+                    help='Use anonymous (unsigned) S3 access — for local testing without AWS credentials')
+parser.add_argument('--plot-full-history', action='store_true', default=False,
+                    help='Also plot corrected vs. estimated NO2 over the full GEOS-CF period')
+parser.add_argument('--full-history-resample', type=str, default='7D', metavar='FREQ',
+                    help='Resample frequency for the full-history plot (default: 7D)')
 args = parser.parse_args()
 
 # Config
@@ -45,6 +53,8 @@ CLEAN_LOCAL = args.clean_local
 NO_LOCAL_SAVE = args.no_local_save
 SAVE_PLOTS_LOCAL = True
 UPLOAD_PLOTS_S3 = True
+PLOT_FULL_HISTORY = args.plot_full_history
+FULL_HISTORY_RESAMPLE = args.full_history_resample
 FORECAST_HOURS_THRESHOLD = 3
 STALE_HOURS = args.stale_hours
 FORCE_UPDATE = args.force_update
@@ -63,7 +73,10 @@ if args.locations:
         # Parse comma-separated list
         LOCATION_FILTER = set(loc.strip() for loc in args.locations.split(',') if loc.strip())
         print(f"Location filter from argument: {len(LOCATION_FILTER)} locations")
-   
+
+LOCATION_ID_FILTER = args.location_id.lstrip('-') if args.location_id else None
+if LOCATION_ID_FILTER:
+    print(f"Location ID filter: {LOCATION_ID_FILTER}")
 
 # Cache
 MODEL_CACHE_SOURCE = args.model_cache
@@ -80,7 +93,7 @@ S3_PREFIXES = {
 }
 
 # Init
-s3_manager = S3Manager(bucket_name=S3_BUCKET)
+s3_manager = S3Manager(bucket_name=S3_BUCKET, anon=args.s3_anon)
 s3_client = boto3.client("s3")
 
 # Legacy
@@ -109,7 +122,7 @@ if CLEAN_LOCAL:
 
 # Locations
 url = "https://raw.githubusercontent.com/noussairlazrak/MLpred/refs/heads/main/global.json"
-config_msg = f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}, STALE_HOURS={STALE_HOURS}, FORCE_SOURCES={FORCE_SOURCES}, SKIP_SOURCES={SKIP_SOURCES}"
+config_msg = f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}, STALE_HOURS={STALE_HOURS}, FORCE_SOURCES={FORCE_SOURCES}, SKIP_SOURCES={SKIP_SOURCES}, PLOT_FULL_HISTORY={PLOT_FULL_HISTORY}"
 if LOCATION_FILTER:
     config_msg += f", LOCATION_FILTER={len(LOCATION_FILTER)} locations"
 print(config_msg)
@@ -139,6 +152,8 @@ else:
 
 # Forecasts
 for key, location_data in list(data.items()):
+    if LOCATION_ID_FILTER and key.lstrip('-') != LOCATION_ID_FILTER:
+        continue
     if location_data.get("observation_source") in ("DoS_Missions", "NASA Pandora", "REMMAQ"):
         obs_source = location_data["observation_source"]
 
@@ -386,6 +401,34 @@ for key, location_data in list(data.items()):
                     except Exception as plot_err:
                         print(f"Plot failed for {locname}: {plot_err}")
                         traceback.print_exc()
+
+                    if PLOT_FULL_HISTORY:
+                        try:
+                            local_hist_plot_path = os.path.join(local_plot_dir, f"{locname}_historical.png")
+                            hist_cols = [c for c in ["no2", "corrected"] if c in fcast.columns]
+                            hist_colors = ['black', 'red'][:len(hist_cols)]
+                            hist_styles = ['--', '-'][:len(hist_cols)]
+                            funcs.gen_plot(
+                                fcast,
+                                [hist_cols],
+                                [hist_colors],
+                                [hist_styles],
+                                'NO2',
+                                [f'{locname} — full GEOS-CF period'],
+                                sv_pth=local_hist_plot_path,
+                                lbl_rnm={"no2": "Estimated (GEOS-CF)", "corrected": "Corrected"},
+                                resample=FULL_HISTORY_RESAMPLE,
+                            )
+                            print(f"Full-history plot generated for {locname}")
+                            if UPLOAD_PLOTS_S3:
+                                hist_plot_s3_key = f"{S3_PREFIXES['plots']}/{locname}_historical.png"
+                                if s3_manager.upload_file(local_hist_plot_path, hist_plot_s3_key):
+                                    print(f"Full-history plot for {locname} uploaded to S3")
+                                    if CLEAN_LOCAL and os.path.exists(local_hist_plot_path):
+                                        os.remove(local_hist_plot_path)
+                        except Exception as plot_err:
+                            print(f"Full-history plot failed for {locname}: {plot_err}")
+                            traceback.print_exc()
 
 
                 # Two precomputed variants per location:

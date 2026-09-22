@@ -1052,7 +1052,7 @@ class ObsSite:
                     df_all = [df_existing]
 
                     try:
-                        ipath_fc = fsspec.get_mapper(S3_FORECASTS_TEMPLATE)
+                        ipath_fc = fsspec.get_mapper(S3_FORECASTS_TEMPLATE, anon=True)
                         ds_fc = xr.open_zarr(ipath_fc)
 
                         df_fc = (ds_fc.sel(lon=ilon, lat=ilat, lev=1, method='nearest')
@@ -1099,7 +1099,7 @@ class ObsSite:
                 for label, template in sources.items():
                     print(f"Reading {label} data from {template}...")
                     try:
-                        ipath = fsspec.get_mapper(template)
+                        ipath = fsspec.get_mapper(template, anon=True)
                         ds = xr.open_zarr(ipath)
 
                         df = (ds.sel(lon=ilon, lat=ilat, lev=1, method='nearest')

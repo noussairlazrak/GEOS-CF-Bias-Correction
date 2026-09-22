@@ -28,12 +28,7 @@ DEFAULT_CACHE_HOURS: int = 24
 
 PANDORA_API_BASE: str = "https://api.pandonia-global-network.org"
 
-#: Pandora L2 quality flags encode quality level in the units digit
-#: (0=high, 1=medium, 2=low) and assurance state in the tens digit
-#: (assured=0x, not-yet-assured/preliminary=1x). Per the Pandonia Global
-#: Network / NASA Pandora Project documentation, flags 0 and 10 are both
-#: "high quality" (assured and not-yet-assured respectively) and safe to
-#: use; 1/11 (medium) and 2/12 (low) are excluded here.
+# 0 = high quality assured, 10 = high quality not-yet-assured; both are safe to use
 HIGH_QUALITY_FLAGS = (0, 10)
 
 
@@ -47,14 +42,7 @@ _PANDORA_FILENAME_RE = re.compile(
 
 
 def _site_from_url(url: str) -> str:
-    """
-    Extract a short, filesystem-safe site name from a Pandora file URL.
-
-    The Pandora URL structure is:
-        .../data.pandonia-global-network.org/<Site>/Pandora<N>s<N>/L2/<file>
-    so the first path segment after the host is the site name (e.g. ``Agam``).
-    Falls back to the first 10 chars of the URL MD5 if parsing fails.
-    """
+    """Get the site name from a Pandora URL, or an md5 fallback if parsing fails."""
     try:
         from urllib.parse import urlparse
         parts = [p for p in urlparse(url).path.split("/") if p]
@@ -91,12 +79,7 @@ def _pandora_bulk_l2_url(
 
 
 def _cache_path(pollutant: str, location: Optional[str] = None, url: Optional[str] = None) -> str:
-    """
-    Return the local CSV path for a Pandora observation.
-
-    Filename format: ``<Site>_<pollutant>.csv``  (e.g. ``Agam_no2.csv``).
-    *location* overrides the site derived from *url*.
-    """
+    """Local CSV cache path, e.g. Agam_no2.csv. location overrides the site from url."""
     os.makedirs(OBS_CACHE_DIR, exist_ok=True)
     if location:
         site = re.sub(r'[^\w\-]', '_', location.strip())
@@ -117,19 +100,7 @@ def _is_cache_fresh(path: str, hours: int) -> bool:
 
 
 def extract_metadata(content: str) -> dict:
-    """
-    Extract site metadata from a Pandora file's header section.
-
-    Parameters
-    ----------
-    content : str
-        Raw text content of the Pandora file.
-
-    Returns
-    -------
-    dict
-        Dictionary with keys: ``location_name``, ``latitude``, ``longitude``.
-    """
+    """Get location_name, latitude, longitude from a Pandora file's header."""
     location_name = re.search(r'Full location name:\s*(.+)', content).group(1).strip()
     latitude = float(re.search(r'Location latitude \[deg\]:\s*([-\d.]+)', content).group(1))
     longitude = float(re.search(r'Location longitude \[deg\]:\s*([-\d.]+)', content).group(1))
@@ -145,29 +116,13 @@ def convert_no2_mol_m3_to_ppbv(
     temperature_k: pd.Series,
     pressure_mbar: pd.Series,
 ) -> pd.Series:
-    """
-    Convert NO2 concentration from mol/m³ to ppbv using the ideal gas law.
-
-    Parameters
-    ----------
-    no2_mol_m3 : array-like
-        NO2 concentration in mol/m³.
-    temperature_k : array-like
-        Ambient temperature in Kelvin.
-    pressure_mbar : array-like
-        Ambient pressure in millibars.
-
-    Returns
-    -------
-    pd.Series
-        NO2 concentration in ppbv.
-    """
+    """Convert NO2 from mol/m³ to ppbv using the ideal gas law."""
     pressure_atm = pressure_mbar / 1013.25
     return no2_mol_m3 * (24.45 * 1e9) / (0.0821 * temperature_k * pressure_atm)
 
 
 def _filter_high_quality(df: pd.DataFrame, flag_col: str, silent: bool = True) -> pd.DataFrame:
-    """Keep only rows whose *flag_col* is a high-quality Pandora flag (0 or 10)."""
+    """Keep only rows with a high-quality Pandora flag (0 or 10)."""
     flags = pd.to_numeric(df[flag_col], errors='coerce')
     kept = df[flags.isin(HIGH_QUALITY_FLAGS)]
     if not silent:
@@ -223,7 +178,6 @@ def read_pandora(
     pd.to_datetime(df[0], format="mixed", utc=True, errors="coerce")
       .dt.strftime("%Y%m%dT%H%M%SZ"))
 
-    # ------------------------------------------------------------------ NO2 --
     if pollutant.lower() == 'no2':
         result_df = pd.DataFrame({
             'time':                          df['time'],
@@ -263,7 +217,6 @@ def read_pandora(
         ]
         result_df = _filter_high_quality(result_df, 'quality_flag_no2', silent=silent)
 
-    # ------------------------------------------------------------------ O3 ---
     elif pollutant.lower() == 'o3':
         result_df = pd.DataFrame({
             'time':                                  df['time'],

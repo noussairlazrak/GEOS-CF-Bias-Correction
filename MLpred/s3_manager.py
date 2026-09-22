@@ -14,6 +14,8 @@ from typing import Optional, Union, List, Dict, Any
 from pathlib import Path
 
 import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
 from botocore.exceptions import ClientError, NoCredentialsError, BotoCoreError
 import pandas as pd
 
@@ -48,14 +50,16 @@ class S3Manager:
         self,
         bucket_name: Optional[str] = None,
         region_name: str = 'us-east-1',
-        profile_name: Optional[str] = None
+        profile_name: Optional[str] = None,
+        anon: bool = False
     ):
         self.bucket_name = bucket_name.replace('s3://', '') if bucket_name else None
         self.region_name = region_name
         self.profile_name = profile_name
+        self.anon = anon
         self._client = None
         self._resource = None
-        
+
     @property
     def client(self) -> boto3.client:
         """Lazy-loaded S3 client."""
@@ -64,9 +68,10 @@ class S3Manager:
             if self.profile_name:
                 session_kwargs['profile_name'] = self.profile_name
             session = boto3.Session(**session_kwargs)
-            self._client = session.client('s3')
+            client_kwargs = {'config': Config(signature_version=UNSIGNED)} if self.anon else {}
+            self._client = session.client('s3', **client_kwargs)
         return self._client
-    
+
     @property
     def resource(self) -> boto3.resource:
         """Lazy-loaded S3 resource."""
@@ -75,7 +80,8 @@ class S3Manager:
             if self.profile_name:
                 session_kwargs['profile_name'] = self.profile_name
             session = boto3.Session(**session_kwargs)
-            self._resource = session.resource('s3')
+            resource_kwargs = {'config': Config(signature_version=UNSIGNED)} if self.anon else {}
+            self._resource = session.resource('s3', **resource_kwargs)
         return self._resource
  
     # Local Folder Management

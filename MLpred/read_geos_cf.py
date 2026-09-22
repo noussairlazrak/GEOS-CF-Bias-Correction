@@ -64,7 +64,7 @@ def _detect_time_gaps(times, freq=GAP_FREQ, gap_multiplier=GAP_MULTIPLIER):
 def _fetch_time_range(path, lon, lat, start, end, verbose=True):
     """Fetch a single S3 zarr source restricted to a specific time window."""
     try:
-        ds = xr.open_zarr(fsspec.get_mapper(path), consolidated=True)
+        ds = xr.open_zarr(fsspec.get_mapper(path, anon=True), consolidated=True)
         sel = {"lon": lon, "lat": lat, "method": "nearest"}
         if "lev" in ds.dims or "lev" in ds.coords:
             sel["lev"] = 1
@@ -230,7 +230,7 @@ def read_geos_cf(lon, lat, start=None, end=None, version=2, use_cache=True, verb
             print(f"Reading {source_name} from S3...")
 
         try:
-            ds = xr.open_zarr(fsspec.get_mapper(path), consolidated=True)
+            ds = xr.open_zarr(fsspec.get_mapper(path, anon=True), consolidated=True)
             sel = {"lon": lon, "lat": lat, "method": "nearest"}
             if "lev" in ds.dims or "lev" in ds.coords:
                 sel["lev"] = 1
