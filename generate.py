@@ -103,6 +103,10 @@ s3_prefixes = list(S3_PREFIXES.values())
 # Connectivity
 print("Checking S3 connectivity...")
 connectivity = s3_manager.check_connectivity(s3_prefixes)
+if not args.s3_anon and not all(connectivity.values()):
+    print("Credentialed S3 access failed — retrying with anonymous (read-only) access...")
+    s3_manager = S3Manager(bucket_name=S3_BUCKET, anon=True)
+    connectivity = s3_manager.check_connectivity(s3_prefixes)
 for prefix, status in connectivity.items():
     print(f"  {prefix}: {'OK' if status else 'FAIL'}")
 
