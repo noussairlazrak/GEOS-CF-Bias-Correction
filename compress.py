@@ -120,7 +120,8 @@ def generate_all_hourly_snapshots():
     except Exception as e:
         print(f"ERROR: Failed to load sites_index.json from URL: {e}")
     
-    site_files = glob.glob('precomputed/all_dts/*.json')
+    site_files = [f for f in glob.glob('precomputed/all_dts/*.json')
+                  if not f.endswith('_historical.json')]
     sites_data = {}
     
     print(f"Loading {len(site_files)} site files...")
