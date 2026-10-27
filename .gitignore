@@ -134,3 +134,4 @@ GEOS_CF/
 MODELS/
 precomputed/
 plots/
+*.csv
