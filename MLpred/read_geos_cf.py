@@ -37,6 +37,22 @@ GAP_FREQ = "1h"
 GAP_MULTIPLIER = 2
 
 
+def harmonize_geos_cf(df):
+    df = df.rename(columns={"t10m": "t", "u10m": "u", "v10m": "v", "pm25_rh35_gcc": "pm25_rh35"})
+
+    if "aod550_sala" in df.columns and "aod550_salc" in df.columns:
+        df["aod550_ss"] = df["aod550_sala"] + df["aod550_salc"]
+
+    for sp in DEFAULT_GASES + ["so2"]:
+        if sp in df.columns:
+            df[sp] = df[sp] * VVtoPPBV
+
+    df["month"] = df["time"].dt.month
+    df["hour"] = df["time"].dt.hour
+    df["weekday"] = df["time"].dt.weekday
+    return df
+
+
 def _detect_time_gaps(times, freq=GAP_FREQ, gap_multiplier=GAP_MULTIPLIER):
     """
     Find missing spans in a (possibly unsorted, duplicated) time series.
@@ -290,28 +306,13 @@ def read_geos_cf(lon, lat, start=None, end=None, version=2, use_cache=True, verb
             if verbose:
                 print(f"Warning: Could not save cache file: {e}")
 
-    # Harmonization
-    df = df.rename(columns={"t10m": "t", "u10m": "u", "v10m": "v", "pm25_rh35_gcc": "pm25_rh35"})
-
-    # Derived AOD
-    if "aod550_sala" in df.columns and "aod550_salc" in df.columns:
-        df["aod550_ss"] = df["aod550_sala"] + df["aod550_salc"]
-
     # Filter dates
     if start:
         df = df[df["time"] >= start]
     if end:
         df = df[df["time"] <= end]
 
-    # Convert to ppbv
-    for sp in DEFAULT_GASES + ["so2"]:  # Add so2 to the DEFAULT_GASES list
-        if sp in df.columns:
-            df[sp] *= VVtoPPBV
-
-    # Add time features
-    df["month"] = df["time"].dt.month
-    df["hour"] = df["time"].dt.hour
-    df["weekday"] = df["time"].dt.weekday
+    df = harmonize_geos_cf(df)
 
     if verbose:
         print(f"Retrieved {len(df)} total rows from {df['time'].min()} to {df['time'].max()}")

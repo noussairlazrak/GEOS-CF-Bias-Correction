@@ -2,9 +2,15 @@
 """
 bias_corrector.py
 
-Localised bias-correction forecasts using LightGBM trained on
-Pandora (or other) observations merged with GEOS-CF V1 (historical replay)
-and V2 (recent analysis + 5-day forecast).
+Localised forecasts trained on site observations merged with GEOS-CF V1
+(historical replay) and V2 (recent analysis + 5-day forecast).
+
+* Pandora sites use the hybrid approach: GEOS-CF × a learned correction factor.
+* Other sources (e.g. REMMAQ local monitors) are obs-based: the model predicts
+  the local observation directly, with GEOS-CF fields as features.
+
+Site models are chosen among LightGBM, XGBoost and their blend by
+time-series CV.
 """
 
 import sys
@@ -23,6 +29,11 @@ from sklearn.model_selection import TimeSeriesSplit, train_test_split, KFold
 from sklearn.impute import SimpleImputer
 from pyod.models.iforest import IForest
 import joblib
+
+try:
+    import xgboost as xgb
+except ImportError:  # xgboost is optional; LightGBM-only training still works
+    xgb = None
 
 try:
     _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,6 +59,18 @@ from MLpred.s3_manager import S3Manager
 MODELS_LOCAL_DIR = os.path.join(_REPO_ROOT, "MODELS")
 S3_BUCKET        = os.environ.get("GEOS_CF_S3_BUCKET", "smce-geos-cf-public")
 S3_MODELS_PREFIX = "snwg_forecast_working_files/MODELS"
+
+PIPELINE_VERSION = 3
+
+HYBRID_OBS_SOURCES = {"pandora"}
+HYBRID_TARGETS     = ("ratio", "log_ratio")   # accepted when loading models
+OBS_TARGETS        = ("absolute", "log")
+HYBRID_TRAIN_TARGETS = ("log_ratio",)
+RATIO_CLIP         = (0.05, 20.0)
+
+MIN_FEATURE_COVERAGE = 0.5
+MAX_TREES            = 3000
+EARLY_STOP_ROUNDS    = 100
 
 
 def _model_local_paths(loc_clean: str, spec: str):
@@ -116,7 +139,7 @@ def _save_model(model, features, loc_clean: str, spec: str,
 
     try:
         joblib.dump(model, model_path)
-        payload = {"features": features, "target": target_mode}
+        payload = {"features": features, "target": target_mode, "metrics": metrics}
         pickle.dump(payload, open(feature_path, "wb"))
         if metrics:
             import json as _json
@@ -159,7 +182,503 @@ def _persist_location_metrics(loc_clean: str, spec: str, s3_manager: S3Manager,
             print(f"WARNING: Could not persist location metrics: {exc}")
 
 
+def _is_hybrid_source(obs_src: str) -> bool:
+    """True if *obs_src* is modelled with the hybrid (GEOS-CF × factor) approach."""
+    return str(obs_src).lower() in HYBRID_OBS_SOURCES
+
+
+class BlendRegressor:
+    """Average of several regressors trained on the same features and target."""
+
+    def __init__(self, models, names=None):
+        self.models = list(models)
+        self.names  = list(names) if names else [type(m).__name__ for m in self.models]
+
+    @property
+    def feature_name_(self):
+        return _model_feature_names(self.models[0])
+
+    def predict(self, X):
+        return np.mean([m.predict(X) for m in self.models], axis=0)
+
+
+def _model_feature_names(m) -> list:
+    """Feature names a fitted LightGBM / XGBoost / blend model expects, in order."""
+    for attr in ("feature_name_", "feature_names_in_"):
+        names = getattr(m, attr, None)
+        if names is not None:
+            return list(names)
+    if hasattr(m, "get_booster"):
+        return list(m.get_booster().feature_names or [])
+    return []
+
+
+def _clean_name(name: str) -> str:
+    return funcs.clean_feature_names(pd.DataFrame(columns=[name])).columns[0]
+
+
+def _encode_target(obs: np.ndarray, raw: np.ndarray, mode: str) -> np.ndarray:
+    """Concentration → model target space."""
+    if mode == "absolute":
+        return obs.astype(float)
+    if mode == "log":
+        return np.log1p(np.clip(obs, 0, None))
+    ratio = np.clip(obs / np.where(raw > 0, raw, np.nan), *RATIO_CLIP)
+    if mode == "ratio":
+        return ratio
+    if mode == "log_ratio":
+        return np.log(ratio)
+    raise ValueError(f"Unknown target mode: {mode}")
+
+
+def _decode_target(pred: np.ndarray, raw: Optional[np.ndarray], mode: str) -> np.ndarray:
+    """Model target space → concentration."""
+    if mode == "absolute":
+        return np.clip(pred, 0, None)
+    if mode == "log":
+        return np.clip(np.expm1(pred), 0, None)
+    if raw is None:
+        return np.full(len(pred), np.nan)
+    if mode == "ratio":
+        return raw * np.clip(pred, *RATIO_CLIP)
+    if mode == "log_ratio":
+        return raw * np.exp(np.clip(pred, *np.log(RATIO_CLIP)))
+    raise ValueError(f"Unknown target mode: {mode}")
+
+
+def _make_regressor(algo: str, n_estimators: int, n_samples: int,
+                    early_stopping: bool = False):
+    """Gradient-boosted regressor with defaults tuned for hourly site data."""
+    min_leaf = int(np.clip(n_samples // 200, 10, 50))
+    if algo == "lgbm_reg":
+        return lgb.LGBMRegressor(
+            n_estimators=n_estimators, learning_rate=0.03,
+            num_leaves=15, max_depth=6, min_child_samples=2 * min_leaf,
+            subsample=0.7, subsample_freq=1, colsample_bytree=0.6,
+            reg_alpha=1.0, reg_lambda=5.0,
+            verbosity=-1, random_state=42,
+        )
+    if algo == "lgbm":
+        return lgb.LGBMRegressor(
+            n_estimators=n_estimators, learning_rate=0.03,
+            num_leaves=63, max_depth=-1, min_child_samples=min_leaf,
+            subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=1.0,
+            verbosity=-1, random_state=42,
+        )
+    if algo == "xgb":
+        kw = dict(
+            n_estimators=n_estimators, learning_rate=0.03,
+            max_depth=7, min_child_weight=min_leaf,
+            subsample=0.8, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=1.0,
+            tree_method="hist", random_state=42, n_jobs=-1,
+        )
+        if early_stopping:
+            kw["early_stopping_rounds"] = EARLY_STOP_ROUNDS
+        return xgb.XGBRegressor(**kw)
+    raise ValueError(f"Unknown algorithm: {algo}")
+
+
+def _fit_with_early_stopping(algo: str, X: pd.DataFrame, y: np.ndarray):
+    """
+    Fit with early stopping on the chronologically last 10% of *X* (never on
+    the CV validation fold, which would make CV scores optimistic).
+    Returns (model, best_n_trees).
+    """
+    n_es = max(30, int(len(X) * 0.1))
+    if len(X) - n_es < 100:
+        m = _make_regressor(algo, 400, len(X))
+        m.fit(X, y)
+        return m, 400
+
+    X_fit, y_fit = X.iloc[:-n_es], y[:-n_es]
+    X_es,  y_es  = X.iloc[-n_es:], y[-n_es:]
+    m = _make_regressor(algo, MAX_TREES, len(X_fit), early_stopping=True)
+    if algo.startswith("lgbm"):
+        m.fit(X_fit, y_fit, eval_set=[(X_es, y_es)],
+              callbacks=[lgb.early_stopping(EARLY_STOP_ROUNDS, verbose=False),
+                         lgb.log_evaluation(-1)])
+        best = m.best_iteration_ or MAX_TREES
+    else:
+        m.fit(X_fit, y_fit, eval_set=[(X_es, y_es)], verbose=False)
+        best = int(m.best_iteration) + 1
+    return m, best
+
+
+def _score(obs: np.ndarray, pred: np.ndarray):
+    ok = np.isfinite(obs) & np.isfinite(pred)
+    if ok.sum() < 10:
+        return np.nan, np.nan, np.nan
+    o, p = obs[ok], pred[ok]
+    return (float(np.sqrt(mean_squared_error(o, p))),
+            float(r2_score(o, p)),
+            float(mean_absolute_error(o, p)))
+
+
+def _predict_concentration(m, feats, tmode: str, df: pd.DataFrame,
+                           spec: str, fill_limit: int = 3) -> np.ndarray:
+    """
+    Predict concentrations for every row of *df* (time-sorted, clean feature
+    names). Short gaps (≤ *fill_limit* h) are filled; anything longer is left
+    as NaN for the tree models' native missing-value handling, so V2-only
+    columns are not back-filled into the V1 history.
+    Rows without a GEOS-CF value for *spec* return NaN.
+    """
+    cols = _model_feature_names(m) or [_clean_name(f) for f in feats]
+    X = pd.DataFrame({c: (df[c] if c in df.columns else np.nan) for c in cols},
+                     index=df.index).astype(float)
+    X = X.ffill(limit=fill_limit).bfill(limit=fill_limit)
+
+    raw_c = _clean_name(spec)
+    raw = (df[raw_c].astype(float).ffill(limit=fill_limit).bfill(limit=fill_limit).values
+           if raw_c in df.columns else None)
+
+    conc = _decode_target(m.predict(X), raw, tmode)
+    if raw is not None:
+        conc = np.where(np.isfinite(raw), conc, np.nan)
+    return conc
+
+
+def _train_site_model(merged: pd.DataFrame, spec: str, hybrid: bool,
+                      rmv_out: bool = True, silent: bool = False):
+    """
+    Train a per-site model, choosing among LightGBM / XGBoost / their blend
+    and two target transforms by time-series CV R² (in concentration space).
+
+    * hybrid (Pandora): target = obs / GEOS-CF, as ``ratio`` or ``log_ratio``.
+    * obs-based (local sources, e.g. REMMAQ): the model predicts the local
+      observation directly, as ``absolute`` or ``log``; GEOS-CF fields are
+      just features.
+
+    Returns (model, features, metrics) or (None, None, None).
+    """
+    raw_col = spec if spec in merged.columns else next(
+        (c for c in merged.columns if spec.lower() in c.lower() and c != "value"), None)
+
+    df = merged[np.isfinite(merged["value"].astype(float))].copy()
+
+    if hybrid:
+        if raw_col is None:
+            print(f"ERROR: Hybrid approach needs a GEOS-CF '{spec}' column — none found")
+            return None, None, None
+        df = df[(df[raw_col] > 0) & (df["value"] >= 0)]
+        target_modes = HYBRID_TRAIN_TARGETS
+    else:
+        df["value"] = df["value"].clip(lower=0)
+        target_modes = OBS_TARGETS
+
+    if rmv_out and len(df) > 100:
+        if hybrid:
+            lr  = np.log(np.clip(df["value"] / df[raw_col], *RATIO_CLIP)).values.reshape(-1, 1)
+            clf = IForest(contamination=0.02, random_state=42)
+            clf.fit(lr)
+            keep = clf.predict(lr) != 1
+        else:
+            q1, q3 = df["value"].quantile([0.25, 0.75])
+            keep = (df["value"] <= q3 + 10 * (q3 - q1)).values
+        if not silent:
+            print(f"INFO: Outlier removal: {(~keep).sum()} removed, {keep.sum()} remaining")
+        df = df[keep]
+
+    if len(df) < 50:
+        print(f"ERROR: Insufficient training data ({len(df)} samples)")
+        return None, None, None
+
+    df = df.sort_values("time").reset_index(drop=True)
+
+    skip     = {"time", "location", "lat", "lon", "value", "bias_ratio"}
+    num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in skip]
+    coverage = df[num_cols].notna().mean()
+    sel_feats = [c for c in num_cols
+                 if coverage[c] >= MIN_FEATURE_COVERAGE and df[c].nunique(dropna=True) > 1]
+    if not silent:
+        dropped = sorted(set(num_cols) - set(sel_feats))
+        print(f"INFO: {len(sel_feats)} features used; {len(dropped)} dropped "
+              f"(coverage < {MIN_FEATURE_COVERAGE:.0%} or constant)")
+
+    X   = funcs.clean_feature_names(df[sel_feats].astype(float))
+    obs = df["value"].values.astype(float)
+    raw = df[raw_col].values.astype(float) if raw_col else None
+    sel_feats = list(X.columns)
+
+    algos = ["lgbm", "lgbm_reg"] + (["xgb"] if xgb is not None else [])
+    if xgb is None and not silent:
+        print("WARNING: xgboost not installed — training LightGBM only")
+
+    n_splits = min(5, max(2, len(df) // 500))
+    folds    = list(TimeSeriesSplit(n_splits=n_splits).split(X))
+    if not silent:
+        print(f"INFO: {'Hybrid' if hybrid else 'Obs-based'} training — "
+              f"{len(df)} samples, {n_splits}-fold time-series CV, "
+              f"algos={algos}, targets={list(target_modes)}")
+
+    def _cv_scores(fold_preds, mode):
+        rows = [_score(obs[val], _decode_target(p, raw[val] if raw is not None else None, mode))
+                for (_, val), p in zip(folds, fold_preds)]
+        return np.array(rows)  # (n_folds, 3) → rmse, r2, mae
+
+    candidates = {}
+    for mode in target_modes:
+        y = _encode_target(obs, raw, mode)
+        per_algo = {}
+        for algo in algos:
+            fold_preds, iters = [], []
+            for tr, val in folds:
+                m, n_best = _fit_with_early_stopping(algo, X.iloc[tr], y[tr])
+                fold_preds.append(m.predict(X.iloc[val]))
+                iters.append(n_best)
+            per_algo[algo] = (fold_preds, iters)
+            candidates[f"{algo}/{mode}"] = dict(
+                algos=[algo], mode=mode, scores=_cv_scores(fold_preds, mode),
+                iters={algo: iters})
+        if len(per_algo) > 1:
+            blend_preds = [np.mean(ps, axis=0) for ps in zip(*(v[0] for v in per_algo.values()))]
+            candidates[f"blend/{mode}"] = dict(
+                algos=list(per_algo), mode=mode, scores=_cv_scores(blend_preds, mode),
+                iters={a: v[1] for a, v in per_algo.items()})
+
+    for name, c in candidates.items():
+        c["r2"] = float(np.nanmean(c["scores"][:, 1]))
+        if not silent:
+            rm, r2, ma = np.nanmean(c["scores"], axis=0)
+            print(f"  {name:<18} CV R²={r2:.3f}±{np.nanstd(c['scores'][:, 1]):.3f}  "
+                  f"RMSE={rm:.3f}  MAE={ma:.3f}")
+
+    best_name = max(candidates, key=lambda k: candidates[k]["r2"]
+                    - (0.005 if k.startswith("blend") else 0.0))
+    best = candidates[best_name]
+    if not silent:
+        for i, (rm, r2, ma) in enumerate(best["scores"], 1):
+            print(f"  Fold {i}/{n_splits}: RMSE={rm:.3f}  R²={r2:.3f}  MAE={ma:.3f}")
+        print(f"INFO: Selected {best_name} (CV R²={best['r2']:.3f})")
+
+    y = _encode_target(obs, raw, best["mode"])
+    models = []
+    for algo in best["algos"]:
+        n_trees = max(50, int(np.median(best["iters"][algo]) * 1.1))
+        m = _make_regressor(algo, n_trees, len(X))
+        m.fit(X, y)
+        models.append(m)
+    model = models[0] if len(models) == 1 else BlendRegressor(models, best["algos"])
+
+    train_pred = _decode_target(model.predict(X), raw, best["mode"])
+    cv_rmse, cv_r2, cv_mae = (round(float(v), 3) for v in np.nanmean(best["scores"], axis=0))
+    metrics = {
+        "CV_RMSE":    cv_rmse,
+        "CV_R2":      cv_r2,
+        "CV_MAE":     cv_mae,
+        "RMSE":       cv_rmse,
+        "R2":         cv_r2,
+        "MAE":        cv_mae,
+        "Train_R2":   round(_score(obs, train_pred)[1], 3),
+        "n_folds":    n_splits,
+        "n_train":    len(df),
+        "trained_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "target":     best["mode"],
+        "algorithm":  best_name.split("/")[0],
+        "approach":   "hybrid" if hybrid else "obs_based",
+        "candidates": {k: round(v["r2"], 3) for k, v in candidates.items()},
+        "pipeline_version": PIPELINE_VERSION,
+        "obs_start":  str(df["time"].min()),
+        "obs_end":    str(df["time"].max()),
+        "source":     "trained",
+    }
+    if not silent:
+        print(f"INFO: Final Train R²={metrics['Train_R2']}  CV R²={cv_r2}  "
+              f"CV RMSE={cv_rmse}  model={best_name}")
+    return model, sel_feats, metrics
+
+
 # Global model
+
+GLOBAL_TAG = "global"
+
+
+def _global_paths(spec: str):
+    """(model_path, feature_path, metrics_path) of the standard global model."""
+    return (os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_basic.joblib"),
+            os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_features_basic.pkl"),
+            os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_metrics.json"))
+
+
+def _load_fresh_global(spec: str, model_max_age_days: int):
+    """Return (model, metrics, features) for a current-recipe global model
+    younger than *model_max_age_days*, else None."""
+    model_path, feature_path, _ = _global_paths(spec)
+    if not (os.path.exists(model_path) and os.path.exists(feature_path)):
+        return None
+    payload = pickle.load(open(feature_path, "rb"))
+    mets = payload.get("metrics") if isinstance(payload, dict) else None
+    if not mets or mets.get("pipeline_version") != PIPELINE_VERSION:
+        print(f"Existing global {spec.upper()} model is from an older recipe — retraining.")
+        return None
+    age_h = (dt.datetime.now().timestamp() - os.path.getmtime(model_path)) / 3600
+    if age_h >= model_max_age_days * 24:
+        return None
+    print(f"Global {spec.upper()} model is fresh ({age_h:.1f}h old) — skipping retraining.")
+    return joblib.load(model_path), mets, payload["features"]
+
+
+def _prepare_global_site_rows(geos_data: pd.DataFrame, obs: pd.DataFrame, spec: str,
+                              lon: float, site: str, rmv_out: bool):
+    """
+    Merge one site's harmonised GEOS-CF (ppbv) with its observations into
+    hybrid training rows. Returns a DataFrame, or a string giving the skip reason.
+    """
+    geos_data = geos_data.sort_values("time").reset_index(drop=True)
+    if spec not in geos_data.columns:
+        return f"no_{spec}_column"
+    med = geos_data[spec].median()
+    if not (med > 1e-3):
+        raise ValueError(f"GEOS-CF {spec} median={med:.3g} — not in ppbv, "
+                         f"pass the data through harmonize_geos_cf()")
+
+    obs = (obs.dropna(subset=["time", "value"])
+              .groupby("time", as_index=False)["value"].mean())
+    geos_data = _add_atmospheric_features(geos_data, spec=spec, lon=lon)
+    merged = (geos_data.drop(columns=[c for c in ("lat", "lon", "location") if c in geos_data.columns])
+                       .merge(obs, on="time", how="inner"))
+    merged = merged[(merged[spec] > 0) & (merged["value"] >= 0)]
+    if len(merged) < 20:
+        return "too_few_rows"
+
+    if rmv_out and len(merged) >= 50:
+        lr  = np.log(np.clip(merged["value"] / merged[spec], *RATIO_CLIP)).values.reshape(-1, 1)
+        clf = IForest(contamination=0.02, random_state=42)
+        clf.fit(lr)
+        merged = merged[clf.predict(lr) != 1]
+
+    merged["_site"] = site
+    float_cols = merged.select_dtypes(include=["float64"]).columns
+    merged[float_cols] = merged[float_cols].astype("float32")
+    return merged
+
+
+def _fit_global_model(pool: pd.DataFrame, spec: str, per_site_log: list,
+                      extra_metrics: dict, s3_manager: S3Manager, silent: bool = False):
+    """
+    Fit the global hybrid (log_ratio) model on pooled Pandora sites.
+
+    CV holds out whole sites (GroupKFold), so scores show how the model does
+    at a site it has never seen. The out-of-fold R² of every site is stored
+    in ``metrics['per_site']``; get_localised_forecast uses it instead of an
+    in-sample evaluation when comparing against a site model.
+    """
+    from sklearn.model_selection import GroupKFold
+
+    pool = pool.sort_values("time").reset_index(drop=True)
+    sites = pool["_site"].values
+    unique_sites = list(pd.unique(sites))
+    if len(unique_sites) < 2:
+        print("ERROR: Global model needs at least 2 sites.")
+        return None, None, None
+
+    skip     = {"time", "location", "lat", "lon", "value", "bias_ratio", "_site"}
+    num_cols = [c for c in pool.select_dtypes(include=[np.number]).columns if c not in skip]
+    coverage = pool[num_cols].notna().mean()
+    sel      = [c for c in num_cols
+                if coverage[c] >= MIN_FEATURE_COVERAGE and pool[c].nunique(dropna=True) > 1]
+
+    X    = funcs.clean_feature_names(pool[sel].astype(float))
+    obs  = pool["value"].values.astype(float)
+    raw  = pool[spec].values.astype(float)
+    mode = "log_ratio"
+    y    = _encode_target(obs, raw, mode)
+    feats = list(X.columns)
+
+    algos   = ["lgbm", "lgbm_reg"] + (["xgb"] if xgb is not None else [])
+    n_folds = min(5, len(unique_sites))
+    folds   = list(GroupKFold(n_splits=n_folds).split(X, y, groups=sites))
+    print(f"\nPooled: {len(pool):,} rows, {len(unique_sites)} sites, {len(feats)} features. "
+          f"{n_folds}-fold site-held-out CV, algos={algos}")
+
+    oof   = {a: np.full(len(pool), np.nan) for a in algos}
+    iters = {a: [] for a in algos}
+    for i, (tr, val) in enumerate(folds, 1):
+        for a in algos:
+            m, n_best = _fit_with_early_stopping(a, X.iloc[tr], y[tr])
+            oof[a][val] = m.predict(X.iloc[val])
+            iters[a].append(n_best)
+        if not silent:
+            print(f"  fold {i}/{n_folds} done ({len(val):,} held-out rows)")
+
+    candidates = {a: [a] for a in algos}
+    if len(algos) > 1:
+        oof["blend"] = np.mean([oof[a] for a in algos], axis=0)
+        candidates["blend"] = algos
+
+    def _per_site(pred_t):
+        conc = _decode_target(pred_t, raw, mode)
+        return {s: round(_score(obs[sites == s], conc[sites == s])[1], 3) for s in unique_sites}
+
+    scores = {}
+    for name in candidates:
+        ps = _per_site(oof[name])
+        conc = _decode_target(oof[name], raw, mode)
+        rmse, pooled_r2, mae = _score(obs, conc)
+        scores[name] = dict(per_site=ps, mean_r2=float(np.nanmean(list(ps.values()))),
+                            pooled_r2=pooled_r2, rmse=rmse, mae=mae)
+        print(f"  {name:<9} mean site R²={scores[name]['mean_r2']:.3f}  "
+              f"pooled R²={pooled_r2:.3f}  RMSE={rmse:.3f}  MAE={mae:.3f}")
+
+    best = max(scores, key=lambda k: scores[k]["mean_r2"] - (0.005 if k == "blend" else 0.0))
+    print(f"Selected global model: {best}")
+
+    models = []
+    for a in candidates[best]:
+        m = _make_regressor(a, max(50, int(np.median(iters[a]) * 1.1)), len(X))
+        m.fit(X, y)
+        models.append(m)
+    model = models[0] if len(models) == 1 else BlendRegressor(models, candidates[best])
+
+    sc = scores[best]
+    metrics = {
+        "global_CV_RMSE": round(sc["rmse"], 3),
+        "global_CV_R2":   round(sc["mean_r2"], 3),
+        "global_CV_MAE":  round(sc["mae"], 3),
+        "global_pooled_CV_R2": round(sc["pooled_r2"], 3),
+        "RMSE":       round(sc["rmse"], 3),
+        "R2":         round(sc["mean_r2"], 3),
+        "MAE":        round(sc["mae"], 3),
+        "Train_R2":   round(_score(obs, _decode_target(model.predict(X), raw, mode))[1], 3),
+        "per_site":   sc["per_site"],
+        "site_summary": per_site_log,
+        "candidates": {k: round(v["mean_r2"], 3) for k, v in scores.items()},
+        "n_train":    int(len(pool)),
+        "n_sites":    len(unique_sites),
+        "target":     mode,
+        "algorithm":  best,
+        "approach":   "hybrid",
+        "spec":       spec,
+        "source":     "global",
+        "pipeline_version": PIPELINE_VERSION,
+        "trained_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        **extra_metrics,
+    }
+    print(f"Global model — CV mean site R²={metrics['R2']}  Train R²={metrics['Train_R2']}")
+
+    import json as _json
+    model_path, feature_path, metrics_path = _global_paths(spec)
+    os.makedirs(MODELS_LOCAL_DIR, exist_ok=True)
+    try:
+        joblib.dump(model, model_path)
+        pickle.dump({"features": feats, "target": mode, "metrics": metrics}, open(feature_path, "wb"))
+        with open(metrics_path, "w") as _f:
+            _json.dump(metrics, _f, indent=2)
+        print(f"Global model saved → {model_path}")
+    except Exception as exc:
+        print(f"WARNING: Could not save global model locally: {exc}")
+
+    try:
+        for path in (model_path, feature_path, metrics_path):
+            s3_manager.upload_file(path, f"{S3_MODELS_PREFIX}/{os.path.basename(path)}")
+        print(f"Global model uploaded to S3.")
+    except Exception as exc:
+        print(f"WARNING: Could not upload global model to S3: {exc}")
+
+    return model, metrics, feats
+
 
 def train_global_model(
     locations: list,
@@ -175,19 +694,20 @@ def train_global_model(
     s3_manager: S3Manager = None,
 ) -> tuple:
     """
-    Train a single **global** LightGBM model pooled across all supplied locations.
+    Train a single **global** hybrid model pooled across Pandora locations.
 
-    The trained model can later be compared with per-site models to decide
-    which generalises better for any given location.
+    Global models are hybrid (GEOS-CF × learned factor), so only locations
+    with a hybrid observation source (Pandora) are used; others are skipped.
 
     Parameters
     ----------
     locations : list of dict
         Each dict must contain at minimum:
-          ``loc``      – human-readable site name
+          ``loc``      – human-readable site name (as passed to
+                         ``get_localised_forecast``, so per-site CV scores match)
           ``lat``      – latitude
           ``lon``      – longitude
-          ``obs_src``  – observation source (``'pandora'``, ``'local'``, …)
+          ``obs_src``  – observation source (``'pandora'``)
           ``obs_url``  – URL or path to the observation file
         Optional keys (all default to their ``get_localised_forecast`` equivalents):
           ``obs_val_col``, ``time_col``, ``date_fmt``, ``lat_col``, ``lon_col``
@@ -198,13 +718,13 @@ def train_global_model(
     unit : str
         Concentration unit (default: ``'ppb'``).
     rmv_out : bool
-        Apply Isolation-Forest outlier removal per site before pooling.
+        Apply Isolation-Forest outlier removal (on log obs/model) per site.
     obs_cache_hours : int
         Pandora cache staleness threshold.
     force_obs_refresh : bool
         Delete and re-download observation caches.
     model_max_age_days : int
-        If a recent global model exists locally, skip retraining.
+        If a current-recipe global model younger than this exists, skip retraining.
     silent : bool
         Suppress verbose output.
     s3_manager : S3Manager, optional
@@ -212,15 +732,12 @@ def train_global_model(
 
     Returns
     -------
-    model : LGBMRegressor or None
+    model : LGBMRegressor, XGBRegressor, BlendRegressor or None
     metrics : dict or None
-        Keys: ``global_CV_RMSE``, ``global_CV_R2``, ``global_CV_MAE``,
-        ``per_site`` (list of per-site dicts), ``n_train``, ``n_sites``,
-        ``trained_at``, ``target``.
+        Keys include ``global_CV_R2`` (mean held-out site R²), ``per_site``
+        ({site: out-of-fold R²}), ``n_train``, ``n_sites``, ``trained_at``, ``target``.
     feature_names : list[str] or None
     """
-    import json as _json
-
     if st is None:
         st = dt.datetime(2018, 1, 1)
     if ed is None:
@@ -228,35 +745,12 @@ def train_global_model(
     if s3_manager is None:
         s3_manager = S3Manager(bucket_name=S3_BUCKET)
 
-    # Paths for the global model
-    GLOBAL_TAG   = "global"
-    model_path   = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_basic.joblib")
-    feature_path = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_features_basic.pkl")
-    metrics_path = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_metrics.json")
+    fresh = _load_fresh_global(spec, model_max_age_days)
+    if fresh is not None:
+        return fresh
 
-    # Check if a sufficiently fresh global model already exists
-    if (
-        os.path.exists(model_path) and
-        os.path.exists(feature_path) and
-        (dt.datetime.now().timestamp() - os.path.getmtime(model_path)) < model_max_age_days * 86400
-    ):
-        age_h = (dt.datetime.now().timestamp() - os.path.getmtime(model_path)) / 3600
-        print(f"Global model is fresh ({age_h:.1f}h old). Loading from disk.")
-        model = joblib.load(model_path)
-        payload = pickle.load(open(feature_path, "rb"))
-        sel_feats = payload["features"] if isinstance(payload, dict) else payload
-        existing_metrics = {}
-        if os.path.exists(metrics_path):
-            try:
-                with open(metrics_path) as _f:
-                    existing_metrics = _json.load(_f)
-            except Exception:
-                pass
-        return model, existing_metrics, sel_feats
-
-    # Collect data from every location
-    all_frames   = []   # pooled training rows
-    per_site_log = []   # per-site data-availability log
+    all_frames   = []
+    per_site_log = []
 
     print(f"\n{'='*60}")
     print(f"Training GLOBAL {spec.upper()} model  ({len(locations)} locations)")
@@ -267,99 +761,51 @@ def train_global_model(
         lat      = float(loc_cfg["lat"])
         lon      = float(loc_cfg["lon"])
         obs_src  = loc_cfg.get("obs_src", "pandora")
-        obs_url  = loc_cfg.get("obs_url", "")
-        obs_val_col = loc_cfg.get("obs_val_col", "value")
-        time_col    = loc_cfg.get("time_col",    "time")
-        date_fmt    = loc_cfg.get("date_fmt",    "%Y-%m-%d %H:%M")
-        lat_col     = loc_cfg.get("lat_col",     None)
-        lon_col     = loc_cfg.get("lon_col",     None)
+
+        if not _is_hybrid_source(obs_src):
+            print(f"  [{loc}] skipped — obs_src='{obs_src}' is obs-based, not hybrid.")
+            per_site_log.append({"loc": loc, "status": "not_hybrid_source", "n_rows": 0})
+            continue
 
         print(f"\n  [{loc}]  lat={lat:.3f}  lon={lon:.3f}  src={obs_src}")
-
         try:
-            # Observations
             obs_data = _load_observations(
-                obs_src=obs_src, obs_url=obs_url, openaq_id=None,
+                obs_src=obs_src, obs_url=loc_cfg.get("obs_url", ""), openaq_id=None,
                 spec=spec, lat=lat, lon=lon, mod_src="s3", unit=unit,
-                time_col=time_col, date_fmt=date_fmt, obs_val_col=obs_val_col,
-                lat_col=lat_col, lon_col=lon_col, rmv_out=False,
-                cache_hours=obs_cache_hours, force_refresh=force_obs_refresh,
-                silent=silent,
+                time_col=loc_cfg.get("time_col", "time"),
+                date_fmt=loc_cfg.get("date_fmt", "%Y-%m-%d %H:%M"),
+                obs_val_col=loc_cfg.get("obs_val_col", "value"),
+                lat_col=loc_cfg.get("lat_col"), lon_col=loc_cfg.get("lon_col"),
+                rmv_out=False, cache_hours=obs_cache_hours,
+                force_refresh=force_obs_refresh, silent=silent,
             )
             if obs_data is None or obs_data.empty:
                 print(f"    WARNING: No observations — skipping {loc}.")
                 per_site_log.append({"loc": loc, "status": "no_obs", "n_rows": 0})
                 continue
 
-            # GEOS-CF V1 + V2
-            geos_v1 = read_geos_cf(lon=lon, lat=lat, start=st, end=ed,
-                                           version=1, verbose=False)
-            geos_v2 = read_geos_cf(
-                lon=lon, lat=lat,
-                start=st,
-                end=datetime.now() + timedelta(days=5),
-                version=2, verbose=False,
-            )
             frames_g = []
-            for gv in (geos_v1, geos_v2):
+            for ver, end in ((1, ed), (2, datetime.now() + timedelta(days=5))):
+                gv = read_geos_cf(lon=lon, lat=lat, start=st, end=end, version=ver, verbose=False)
                 if gv is not None and not gv.empty:
-                    gv["time"] = pd.to_datetime(gv["time"]).dt.floor("H")
+                    gv["time"] = _normalize_time(gv["time"])
                     frames_g.append(gv)
             if not frames_g:
                 print(f"    WARNING: No GEOS-CF data — skipping {loc}.")
                 per_site_log.append({"loc": loc, "status": "no_geos_cf", "n_rows": 0})
                 continue
+            geos_data = (pd.concat(frames_g, ignore_index=True)
+                           .drop_duplicates(subset=["time"], keep="first"))
 
-            geos_data = (
-                pd.concat(frames_g, ignore_index=True)
-                .drop_duplicates(subset=["time"], keep="first")
-                .sort_values("time")
-                .reset_index(drop=True)
-            )
-
-            geos_data = _add_atmospheric_features(geos_data, spec=spec)
-
-            # Merge obs + GEOS-CF
-            merged = (
-                geos_data.merge(obs_data[["time", "value"]], on="time", how="inner")
-                         .dropna(subset=["value"])
-            )
-            if len(merged) < 20:
-                print(f"    WARNING: Only {len(merged)} overlap rows — skipping {loc}.")
-                per_site_log.append({"loc": loc, "status": "too_few_rows", "n_rows": len(merged)})
+            rows = _prepare_global_site_rows(geos_data, obs_data[["time", "value"]],
+                                             spec, lon, loc, rmv_out)
+            if isinstance(rows, str):
+                print(f"    WARNING: {rows} — skipping {loc}.")
+                per_site_log.append({"loc": loc, "status": rows, "n_rows": 0})
                 continue
-
-            # Bias ratio target (same logic as per-site training)
-            raw_col = spec
-            if raw_col not in merged.columns:
-                hits = [c for c in merged.columns if spec.lower() in c.lower() and c != "value"]
-                raw_col = hits[0] if hits else None
-
-            if raw_col:
-                raw_vals = merged[raw_col].replace(0, np.nan)
-                merged["bias_ratio"] = (merged["value"] / raw_vals).clip(0.05, 20.0)
-                merged = merged.dropna(subset=["bias_ratio"])
-                target_mode = "ratio"
-            else:
-                target_mode = "absolute"
-
-            # Outlier removal per site
-            if rmv_out and len(merged) >= 50:
-                yvar = "bias_ratio" if target_mode == "ratio" else "value"
-                conc = merged[yvar].values.reshape(-1, 1)
-                clf  = IForest(contamination=0.02)
-                clf.fit(conc)
-                mask = clf.predict(conc) != 1
-                removed = (~mask).sum()
-                merged = merged[mask]
-                if not silent:
-                    print(f"    Outlier removal: {removed} removed, {mask.sum()} remaining.")
-
-            # Tag with site identity (enables per-site holdout CV later)
-            merged["_site"] = loc
-            all_frames.append(merged)
-            per_site_log.append({"loc": loc, "status": "ok", "n_rows": len(merged)})
-            print(f"    OK — {len(merged)} training rows.")
+            all_frames.append(rows)
+            per_site_log.append({"loc": loc, "status": "ok", "n_rows": len(rows)})
+            print(f"    OK — {len(rows)} training rows.")
 
         except Exception as exc:
             import traceback as _tb
@@ -367,178 +813,13 @@ def train_global_model(
             if not silent:
                 _tb.print_exc()
             per_site_log.append({"loc": loc, "status": f"error: {exc}", "n_rows": 0})
-            continue
 
     if not all_frames:
         print("ERROR: No usable data collected for global model training.")
         return None, None, None
 
-    pool = (
-        pd.concat(all_frames, ignore_index=True)
-        .sort_values("time")
-        .reset_index(drop=True)
-    )
-    n_sites_ok = sum(1 for s in per_site_log if s["status"] == "ok")
-    print(f"\nPooled dataset: {len(pool):,} rows from {n_sites_ok} sites.")
-
-    # Feature selection
-    skip      = {"time", "location", "lat", "lon", "value", "bias_ratio", "_site"}
-    num_cols  = pool.select_dtypes(include=[np.number]).columns.tolist()
-    sel_feats = [c for c in num_cols if c not in skip]
-
-    target_mode = "ratio" if "bias_ratio" in pool.columns else "absolute"
-    yvar        = "bias_ratio" if target_mode == "ratio" else "value"
-
-    X_raw, y_raw = funcs.clean_data(pool[sel_feats], pool[yvar])
-    X_all        = funcs.clean_feature_names(X_raw)
-    y_all        = y_raw.values
-    sel_feats_clean = list(X_all.columns)
-
-    def _clean_feat(name: str) -> str:
-        tmp = pd.DataFrame(columns=[name])
-        return funcs.clean_feature_names(tmp).columns[0]
-
-    raw_col_clean = _clean_feat(spec)
-
-    # Leave-one-site-out cross-validation
-    sites        = pool["_site"].values
-    unique_sites = pool["_site"].unique().tolist()
-    print(f"\nLeave-one-site-out CV over {len(unique_sites)} sites …")
-
-    cv_rmses, cv_r2s, cv_maes = [], [], []
-    site_metrics = []
-
-    for hold_site in unique_sites:
-        tr_mask  = sites != hold_site
-        val_mask = sites == hold_site
-
-        if val_mask.sum() < 10:
-            continue
-
-        tx, ty = X_all[tr_mask], y_all[tr_mask]
-        vx, vy = X_all[val_mask], y_all[val_mask]
-
-        _m = lgb.LGBMRegressor(
-            n_estimators=500, max_depth=5,
-            learning_rate=0.03, num_leaves=31,
-            subsample=0.8, colsample_bytree=0.8,
-            min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1,
-            verbosity=-1, random_state=42,
-        )
-        _m.fit(tx, ty,
-               eval_set=[(vx, vy)],
-               callbacks=[lgb.early_stopping(50, verbose=False),
-                          lgb.log_evaluation(-1)])
-
-        pv = _m.predict(vx)
-
-        # Convert back to observation space
-        if target_mode == "ratio" and raw_col_clean in X_all.columns:
-            raw_v    = X_all.loc[val_mask, raw_col_clean].values if raw_col_clean in X_all.columns \
-                       else pool.loc[val_mask, spec].values if spec in pool.columns else None
-            # fall back to the pool's raw column
-            if raw_v is None:
-                raw_v = pool.loc[val_mask, spec].values if spec in pool.columns else np.ones(len(pv))
-            vy_obs = pool.loc[val_mask, "value"].values
-            pv_obs = raw_v * np.clip(pv, 0.05, 20.0)
-        else:
-            vy_obs, pv_obs = vy, pv
-
-        s_rmse = float(np.sqrt(mean_squared_error(vy_obs, pv_obs)))
-        s_r2   = float(r2_score(vy_obs, pv_obs))
-        s_mae  = float(mean_absolute_error(vy_obs, pv_obs))
-
-        cv_rmses.append(s_rmse)
-        cv_r2s.append(s_r2)
-        cv_maes.append(s_mae)
-        site_metrics.append({
-            "site": hold_site,
-            "n_val": int(val_mask.sum()),
-            "RMSE": round(s_rmse, 3),
-            "R2":   round(s_r2,   3),
-            "MAE":  round(s_mae,  3),
-        })
-        if not silent:
-            print(f"  Hold-out [{hold_site}]: "
-                  f"RMSE={s_rmse:.3f}  R2={s_r2:.3f}  MAE={s_mae:.3f}  (n={val_mask.sum()})")
-
-    global_cv_rmse = round(float(np.mean(cv_rmses)), 3) if cv_rmses else None
-    global_cv_r2   = round(float(np.mean(cv_r2s)),   3) if cv_r2s   else None
-    global_cv_mae  = round(float(np.mean(cv_maes)),  3) if cv_maes  else None
-
-    print(f"\nGlobal LOSO-CV → "
-          f"RMSE={global_cv_rmse}  R2={global_cv_r2}  MAE={global_cv_mae}")
-
-    # Final model trained on ALL pooled data
-    print(f"\nFitting final global model on {len(X_all):,} samples …")
-    model_lgb = lgb.LGBMRegressor(
-        n_estimators=500, max_depth=5,
-        learning_rate=0.03, num_leaves=31,
-        subsample=0.8, colsample_bytree=0.8,
-        min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1,
-        verbosity=-1, random_state=42,
-    )
-    model_lgb.fit(X_all, y_all)
-
-    # In-sample sanity check
-    train_preds = model_lgb.predict(X_all)
-    if target_mode == "ratio" and spec in pool.columns:
-        train_obs_preds = pool[spec].values * np.clip(train_preds, 0.05, 20.0)
-        train_obs_true  = pool["value"].values
-    else:
-        train_obs_preds = train_preds
-        train_obs_true  = y_all
-
-    train_r2 = round(float(r2_score(train_obs_true, train_obs_preds)), 3)
-    print(f"Final global model — in-sample R²={train_r2}  (LOSO CV R²={global_cv_r2})")
-
-    # Metrics bundle
-    metrics = {
-        # Aggregate LOSO-CV
-        "global_CV_RMSE": global_cv_rmse,
-        "global_CV_R2":   global_cv_r2,
-        "global_CV_MAE":  global_cv_mae,
-        # Convenience aliases used by plot_forecast / generate.py
-        "RMSE":    global_cv_rmse,
-        "R2":      global_cv_r2,
-        "MAE":     global_cv_mae,
-        "Train_R2": train_r2,
-        # Per-site breakdown
-        "per_site":     site_metrics,
-        "site_summary": per_site_log,
-        # Book-keeping
-        "n_train":    int(len(pool)),
-        "n_sites":    n_sites_ok,
-        "target":     target_mode,
-        "spec":       spec,
-        "source":     "global",
-        "trained_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-    }
-
-    # Persist
-    os.makedirs(MODELS_LOCAL_DIR, exist_ok=True)
-    try:
-        joblib.dump(model_lgb, model_path)
-        payload = {"features": sel_feats_clean, "target": target_mode}
-        pickle.dump(payload, open(feature_path, "wb"))
-        with open(metrics_path, "w") as _f:
-            _json.dump(metrics, _f, indent=2)
-        print(f"Global model saved → {model_path}")
-    except Exception as exc:
-        print(f"WARNING: Could not save global model locally: {exc}")
-
-    try:
-        model_s3_key   = f"{S3_MODELS_PREFIX}/lgbm_{GLOBAL_TAG}_{spec}_basic.joblib"
-        feature_s3_key = f"{S3_MODELS_PREFIX}/lgbm_{GLOBAL_TAG}_{spec}_features_basic.pkl"
-        metrics_s3_key = f"{S3_MODELS_PREFIX}/lgbm_{GLOBAL_TAG}_{spec}_metrics.json"
-        s3_manager.upload_file(model_path,   model_s3_key)
-        s3_manager.upload_file(feature_path, feature_s3_key)
-        s3_manager.upload_file(metrics_path, metrics_s3_key)
-        print(f"Global model uploaded to S3 → {model_s3_key}")
-    except Exception as exc:
-        print(f"WARNING: Could not upload global model to S3: {exc}")
-
-    return model_lgb, metrics, sel_feats_clean
+    pool = pd.concat(all_frames, ignore_index=True)
+    return _fit_global_model(pool, spec, per_site_log, {}, s3_manager, silent=silent)
 
 
 def train_global_model_from_local(
@@ -554,25 +835,29 @@ def train_global_model_from_local(
     s3_manager: S3Manager = None,
 ) -> tuple:
     """
-    Train a global LightGBM model using **only locally cached** observation
-    and GEOS-CF files — no remote downloads.
+    Train the global hybrid model using **only locally cached** Pandora
+    observation and GEOS-CF files — no remote downloads.
 
     File discovery
     --------------
-    Observations  : ``<obs_dir>/<Site>_<spec>.csv``
-    GEOS-CF       : ``<geos_cf_dir>/loc_<lat>_<lon>_v1.csv`` (V1 preferred, V2 fallback)
+    Observations  : ``<obs_dir>/<Site>_<spec>.csv`` (the Pandora cache)
+    GEOS-CF       : ``<geos_cf_dir>/loc_<lat>_<lon>_v{1,2}.csv``
+
+    The GEOS-CF cache stores raw values (mol/mol, V1 column names), so it is
+    passed through ``harmonize_geos_cf`` — the same step ``read_geos_cf``
+    applies — before training. Skipping it was what broke the old global model.
 
     The merged training dataset is saved as a Parquet file alongside the model
     (``MODELS/global_<spec>_pool.parquet``) for future analysis or re-use.
 
     Returns
     -------
-    model : LGBMRegressor or None
+    model : LGBMRegressor, XGBRegressor, BlendRegressor or None
     metrics : dict or None
     feature_names : list[str] or None
     """
-    import json as _json
     import glob
+    from MLpred.read_geos_cf import harmonize_geos_cf
 
     _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
     _REPO     = os.path.dirname(_THIS_DIR)
@@ -584,32 +869,12 @@ def train_global_model_from_local(
     if s3_manager is None:
         s3_manager = S3Manager(bucket_name=S3_BUCKET)
 
-    GLOBAL_TAG   = "global"
-    model_path   = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_basic.joblib")
-    feature_path = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_features_basic.pkl")
-    metrics_path = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_metrics.json")
-    pool_path    = os.path.join(MODELS_LOCAL_DIR, f"global_{spec}_pool.parquet")
+    pool_path = os.path.join(MODELS_LOCAL_DIR, f"global_{spec}_pool.parquet")
 
-    # Early exit if fresh model exists
-    if (
-        os.path.exists(model_path) and os.path.exists(feature_path) and
-        (dt.datetime.now().timestamp() - os.path.getmtime(model_path)) < model_max_age_days * 86400
-    ):
-        age_h = (dt.datetime.now().timestamp() - os.path.getmtime(model_path)) / 3600
-        print(f"Global {spec.upper()} model is fresh ({age_h:.1f}h old) — skipping retraining.")
-        model = joblib.load(model_path)
-        payload = pickle.load(open(feature_path, "rb"))
-        sel_feats = payload["features"] if isinstance(payload, dict) else payload
-        existing_metrics = {}
-        if os.path.exists(metrics_path):
-            try:
-                with open(metrics_path) as _f:
-                    existing_metrics = _json.load(_f)
-            except Exception:
-                pass
-        return model, existing_metrics, sel_feats
+    fresh = _load_fresh_global(spec, model_max_age_days)
+    if fresh is not None:
+        return fresh
 
-    # Discover OBS files
     pattern   = os.path.join(obs_dir, f"*_{spec.lower()}.csv")
     obs_files = sorted(glob.glob(pattern))
     if not obs_files:
@@ -618,7 +883,6 @@ def train_global_model_from_local(
 
     print(f"Training global {spec.upper()} model — {len(obs_files)} OBS files found.")
 
-    # Helpers
     def _coord_to_str(val: float) -> str:
         return f"{val:.6f}".replace(".", "_").replace("-", "m")
 
@@ -629,32 +893,23 @@ def train_global_model_from_local(
             fpath = os.path.join(geos_cf_dir, f"loc_{lat_s}_{lon_s}_v{ver}.csv")
             if os.path.exists(fpath):
                 try:
-                    df = pd.read_csv(fpath, parse_dates=["time"])
+                    df = pd.read_csv(fpath)
                     df["time"] = _normalize_time(df["time"])
-                    frames_g.append(df)
+                    frames_g.append(harmonize_geos_cf(df))
                 except Exception:
                     pass
         if not frames_g:
             return pd.DataFrame()
-        return (
-            pd.concat(frames_g, ignore_index=True)
-            .drop_duplicates(subset=["time"], keep="first")
-            .sort_values("time")
-            .reset_index(drop=True)
-        )
+        return (pd.concat(frames_g, ignore_index=True)
+                  .drop_duplicates(subset=["time"], keep="first"))
 
-    # Build pooled training set
     all_frames   = []
     per_site_log = []
-    skipped = ok = 0
 
     for obs_path in obs_files:
         site_name = os.path.basename(obs_path).replace(f"_{spec.lower()}.csv", "")
         try:
             obs = pd.read_csv(obs_path)
-            obs["time"] = pd.to_datetime(obs["time"]).dt.floor("H")
-
-            # Standardise value column
             if "value" not in obs.columns:
                 for alt in (spec, spec.lower(), "concentration", "val", "obs"):
                     if alt in obs.columns:
@@ -662,125 +917,58 @@ def train_global_model_from_local(
                         break
             if "value" not in obs.columns:
                 per_site_log.append({"loc": site_name, "status": "no_value_col", "n_rows": 0})
-                skipped += 1
                 continue
-
-            obs = obs.dropna(subset=["value"])
-            if obs.empty:
-                per_site_log.append({"loc": site_name, "status": "all_nan", "n_rows": 0})
-                skipped += 1
-                continue
-
+            obs["time"] = _normalize_time(obs["time"])
+            obs = obs.dropna(subset=["time", "value"])
             if st is not None:
                 obs = obs[obs["time"] >= pd.Timestamp(st)]
             if ed is not None:
                 obs = obs[obs["time"] <= pd.Timestamp(ed)]
+            if obs.empty:
+                per_site_log.append({"loc": site_name, "status": "no_obs", "n_rows": 0})
+                continue
 
-            # Resolve coordinates
             lat = lon = None
             for c in ("lat", "latitude", "Latitude"):
-                if c in obs.columns:
-                    v = obs[c].dropna()
-                    if not v.empty:
-                        lat = float(v.iloc[0])
+                if c in obs.columns and obs[c].notna().any():
+                    lat = float(obs[c].dropna().iloc[0])
                     break
             for c in ("lon", "longitude", "Longitude"):
-                if c in obs.columns:
-                    v = obs[c].dropna()
-                    if not v.empty:
-                        lon = float(v.iloc[0])
+                if c in obs.columns and obs[c].notna().any():
+                    lon = float(obs[c].dropna().iloc[0])
                     break
-
             if lat is None or lon is None:
                 per_site_log.append({"loc": site_name, "status": "no_coords", "n_rows": 0})
-                skipped += 1
                 continue
 
             geos_data = _find_geos_cf(lat, lon)
             if geos_data.empty:
                 per_site_log.append({"loc": site_name, "status": "no_geos_cf", "n_rows": 0})
-                skipped += 1
-                del obs
                 continue
 
-            # lag features need the full series, before merging with sparse obs
-            geos_data = _add_atmospheric_features(geos_data, spec=spec)
-
-            # merge obs with geos-cf, trim columns to save memory
-            merged = (
-                geos_data[
-                    [c for c in geos_data.columns if c not in ("lat", "lon", "location")]
-                ]
-                .merge(obs[["time", "value"]], on="time", how="inner")
-                .dropna(subset=["value"])
-            )
-            del geos_data, obs   # free raw data immediately
-
-            if len(merged) < min_overlap_rows:
-                per_site_log.append({"loc": site_name, "status": "too_few_rows", "n_rows": len(merged)})
-                skipped += 1
-                del merged
+            rows = _prepare_global_site_rows(geos_data, obs[["time", "value"]],
+                                             spec, lon, site_name, rmv_out)
+            del geos_data, obs
+            if isinstance(rows, str) or len(rows) < min_overlap_rows:
+                status = rows if isinstance(rows, str) else "too_few_rows"
+                per_site_log.append({"loc": site_name, "status": status, "n_rows": 0})
                 continue
-
-            # Bias-ratio target
-            raw_col = spec
-            if raw_col not in merged.columns:
-                hits = [c for c in merged.columns if spec.lower() in c.lower() and c != "value"]
-                raw_col = hits[0] if hits else None
-
-            if raw_col:
-                raw_vals = merged[raw_col].replace(0, np.nan)
-                merged["bias_ratio"] = (merged["value"] / raw_vals).clip(0.05, 20.0)
-                merged = merged.dropna(subset=["bias_ratio"])
-                target_mode = "ratio"
-            else:
-                target_mode = "absolute"
-
-            if rmv_out and len(merged) >= 50:
-                yvar_tmp = "bias_ratio" if target_mode == "ratio" else "value"
-                conc = merged[yvar_tmp].values.reshape(-1, 1)
-                clf  = IForest(contamination=0.02)
-                clf.fit(conc)
-                merged = merged[clf.predict(conc) != 1]
-
-            merged["_site"] = site_name
-
-            # keep numeric cols only, cast to float32 to save memory
-            keep_cols = (
-                ["time", "_site", "value", "bias_ratio"]
-                + [c for c in merged.select_dtypes(include=[np.number]).columns
-                   if c not in ("value", "bias_ratio")]
-            )
-            keep_cols = [c for c in keep_cols if c in merged.columns]
-            merged = merged[keep_cols].copy()
-            float_cols = merged.select_dtypes(include=["float64"]).columns
-            merged[float_cols] = merged[float_cols].astype("float32")
-
-            all_frames.append(merged)
-            per_site_log.append({"loc": site_name, "status": "ok", "n_rows": len(merged)})
-            ok += 1
-            del merged
+            all_frames.append(rows)
+            per_site_log.append({"loc": site_name, "status": "ok", "n_rows": len(rows)})
 
         except Exception as exc:
             per_site_log.append({"loc": site_name, "status": f"error: {exc}", "n_rows": 0})
-            skipped += 1
-            continue
 
+    n_ok = sum(1 for s in per_site_log if s["status"] == "ok")
+    print(f"{n_ok} sites usable, {len(per_site_log) - n_ok} skipped.")
     if not all_frames:
         print("No usable data collected — global model not trained.")
         return None, None, None
 
-    import gc
-    pool = (
-        pd.concat(all_frames, ignore_index=True)
-        .sort_values("time")
-        .reset_index(drop=True)
-    )
+    pool = pd.concat(all_frames, ignore_index=True)
     del all_frames
     gc.collect()
-    print(f"Pooled: {len(pool):,} rows from {ok} sites ({skipped} skipped).")
 
-    # Save pooled dataset for future reuse
     os.makedirs(MODELS_LOCAL_DIR, exist_ok=True)
     try:
         pool.to_parquet(pool_path, index=False)
@@ -790,132 +978,10 @@ def train_global_model_from_local(
         if not silent:
             print(f"WARNING: Could not save pooled dataset: {exc}")
 
-    # Feature selection
-    skip      = {"time", "location", "lat", "lon", "value", "bias_ratio", "_site"}
-    num_cols  = pool.select_dtypes(include=[np.number]).columns.tolist()
-    sel_feats = [c for c in num_cols if c not in skip]
+    extra = {"source": "global_local", "obs_dir": obs_dir,
+             "geos_cf_dir": geos_cf_dir, "pool_path": pool_path}
+    return _fit_global_model(pool, spec, per_site_log, extra, s3_manager, silent=silent)
 
-    target_mode = "ratio" if "bias_ratio" in pool.columns else "absolute"
-    yvar        = "bias_ratio" if target_mode == "ratio" else "value"
-
-    X_raw, y_raw = funcs.clean_data(pool[sel_feats], pool[yvar])
-    X_all        = funcs.clean_feature_names(X_raw)
-    y_all        = y_raw.values
-    sel_feats_clean = list(X_all.columns)
-
-    def _clean_feat(name: str) -> str:
-        tmp = pd.DataFrame(columns=[name])
-        return funcs.clean_feature_names(tmp).columns[0]
-
-    # Leave-one-site-out CV
-    sites        = pool["_site"].values
-    unique_sites = pool["_site"].unique().tolist()
-    print(f"LOSO-CV over {len(unique_sites)} sites …")
-
-    cv_rmses, cv_r2s, cv_maes = [], [], []
-    site_metrics = []
-
-    for hold_site in unique_sites:
-        tr_mask  = sites != hold_site
-        val_mask = sites == hold_site
-        if val_mask.sum() < 10:
-            continue
-
-        _m = lgb.LGBMRegressor(
-            n_estimators=500, max_depth=5, learning_rate=0.03, num_leaves=31,
-            subsample=0.8, colsample_bytree=0.8, min_child_samples=20,
-            reg_alpha=0.1, reg_lambda=0.1, verbosity=-1, random_state=42,
-        )
-        _m.fit(
-            X_all[tr_mask], y_all[tr_mask],
-            eval_set=[(X_all[val_mask], y_all[val_mask])],
-            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
-        )
-        pv = _m.predict(X_all[val_mask])
-
-        if target_mode == "ratio" and spec in pool.columns:
-            raw_v  = pool.loc[val_mask, spec].values
-            vy_obs = pool.loc[val_mask, "value"].values
-            pv_obs = raw_v * np.clip(pv, 0.05, 20.0)
-        else:
-            vy_obs = y_all[val_mask]
-            pv_obs = pv
-
-        s_rmse = float(np.sqrt(mean_squared_error(vy_obs, pv_obs)))
-        s_r2   = float(r2_score(vy_obs, pv_obs))
-        s_mae  = float(mean_absolute_error(vy_obs, pv_obs))
-        cv_rmses.append(s_rmse); cv_r2s.append(s_r2); cv_maes.append(s_mae)
-        site_metrics.append({
-            "site": hold_site, "n_val": int(val_mask.sum()),
-            "RMSE": round(s_rmse, 3), "R2": round(s_r2, 3), "MAE": round(s_mae, 3),
-        })
-
-    global_cv_rmse = round(float(np.mean(cv_rmses)), 3) if cv_rmses else None
-    global_cv_r2   = round(float(np.mean(cv_r2s)),   3) if cv_r2s   else None
-    global_cv_mae  = round(float(np.mean(cv_maes)),  3) if cv_maes  else None
-    print(f"LOSO-CV → RMSE={global_cv_rmse}  R2={global_cv_r2}  MAE={global_cv_mae}")
-
-    # Final model on all pooled data
-    model_lgb = lgb.LGBMRegressor(
-        n_estimators=500, max_depth=5, learning_rate=0.03, num_leaves=31,
-        subsample=0.8, colsample_bytree=0.8, min_child_samples=20,
-        reg_alpha=0.1, reg_lambda=0.1, verbosity=-1, random_state=42,
-    )
-    model_lgb.fit(X_all, y_all)
-
-    train_preds = model_lgb.predict(X_all)
-    if target_mode == "ratio" and spec in pool.columns:
-        train_obs_preds = pool[spec].values * np.clip(train_preds, 0.05, 20.0)
-        train_obs_true  = pool["value"].values
-    else:
-        train_obs_preds, train_obs_true = train_preds, y_all
-
-    train_r2 = round(float(r2_score(train_obs_true, train_obs_preds)), 3)
-    print(f"Final model — train R²={train_r2}  CV R²={global_cv_r2}")
-
-    # Metrics bundle
-    metrics = {
-        "global_CV_RMSE": global_cv_rmse,
-        "global_CV_R2":   global_cv_r2,
-        "global_CV_MAE":  global_cv_mae,
-        "RMSE":      global_cv_rmse,
-        "R2":        global_cv_r2,
-        "MAE":       global_cv_mae,
-        "Train_R2":  train_r2,
-        "per_site":  site_metrics,
-        "site_summary": per_site_log,
-        "n_train":   int(len(pool)),
-        "n_sites":   ok,
-        "target":    target_mode,
-        "spec":      spec,
-        "source":    "global_local",
-        "obs_dir":   obs_dir,
-        "geos_cf_dir": geos_cf_dir,
-        "pool_path": pool_path,
-        "trained_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-    }
-
-    # Persist locally + upload to S3
-    try:
-        joblib.dump(model_lgb, model_path)
-        pickle.dump({"features": sel_feats_clean, "target": target_mode}, open(feature_path, "wb"))
-        with open(metrics_path, "w") as _f:
-            _json.dump(metrics, _f, indent=2)
-        print(f"Model saved → {model_path}")
-    except Exception as exc:
-        print(f"WARNING: Could not save model: {exc}")
-
-    try:
-        s3_manager.upload_file(model_path,   f"{S3_MODELS_PREFIX}/lgbm_{GLOBAL_TAG}_{spec}_basic.joblib")
-        s3_manager.upload_file(feature_path, f"{S3_MODELS_PREFIX}/lgbm_{GLOBAL_TAG}_{spec}_features_basic.pkl")
-        s3_manager.upload_file(metrics_path, f"{S3_MODELS_PREFIX}/lgbm_{GLOBAL_TAG}_{spec}_metrics.json")
-        if not silent:
-            print(f"Model uploaded to S3.")
-    except Exception as exc:
-        if not silent:
-            print(f"WARNING: S3 upload failed: {exc}")
-
-    return model_lgb, metrics, sel_feats_clean
 
 
 def _load_observations(obs_src: str, obs_url: str,
@@ -966,7 +1032,7 @@ def _format_metrics_summary(metrics: dict) -> str:
     """One-line, human-readable summary of a model metrics dict for logging."""
     if not metrics:
         return "no metrics available"
-    keys = ("source", "target", "R2", "RMSE", "MAE",
+    keys = ("source", "approach", "algorithm", "target", "R2", "RMSE", "MAE",
             "CV_R2", "CV_RMSE", "CV_MAE", "Train_R2", "n_train", "trained_at")
     bits = [f"{k}={metrics[k]}" for k in keys if metrics.get(k) is not None]
     return ", ".join(bits) if bits else "no metrics available"
@@ -988,7 +1054,8 @@ def _normalize_time(series):
         .dt.tz_localize(None)
     )
 
-def _add_atmospheric_features(df: pd.DataFrame, spec: str = "no2") -> pd.DataFrame:
+def _add_atmospheric_features(df: pd.DataFrame, spec: str = "no2",
+                              lon: Optional[float] = None) -> pd.DataFrame:
     """
     Enrich a GEOS-CF (or merged) DataFrame with engineered features that
     capture atmospheric and temporal patterns the raw model variables miss.
@@ -1000,22 +1067,21 @@ def _add_atmospheric_features(df: pd.DataFrame, spec: str = "no2") -> pd.DataFra
         ``doy_sin``,  ``doy_cos``   – annual cycle (avoids 1/365 discontinuity)
         ``weekday``                 – integer 0-6 (Mon-Sun)
         ``is_weekend``              – binary flag
+        ``lst_hour``, ``lst_weekday``, ``lst_is_weekend`` – same in local
+                         solar time (only when *lon* is given), so traffic
+                         rush hours and weekends line up with local habits
 
     Atmospheric proxies
         ``pbl_proxy``  – log(PBLH) if a PBL-height column is present; captures
                          mixing-layer dilution effect on surface concentrations.
         ``t2m_delta``  – T2M − T850 (lapse-rate proxy for convective mixing)
                          only added when both columns exist.
-
-    Lagged species
-        ``{spec}_lag1h``, ``{spec}_lag3h``, ``{spec}_lag6h``
-        ``{spec}_lag24h`` – yesterday-same-hour persistence signal
-        ``{spec}_roll3h``,``{spec}_roll6h`` – short rolling means for trend context
-
+        ``wind_speed``, ``wind_dir_sin``, ``wind_dir_cos`` – from u/v
+        ``ventilation`` – wind speed × PBLH (dispersion capacity)
     """
     out = df.copy()
 
-    # Cyclical 
+    # Cyclical
     t = pd.to_datetime(out["time"])
     out["hour_sin"]  = np.sin(2 * np.pi * t.dt.hour / 24)
     out["hour_cos"]  = np.cos(2 * np.pi * t.dt.hour / 24)
@@ -1024,47 +1090,33 @@ def _add_atmospheric_features(df: pd.DataFrame, spec: str = "no2") -> pd.DataFra
     out["weekday"]   = t.dt.weekday.astype(float)
     out["is_weekend"] = (t.dt.weekday >= 5).astype(float)
 
-    # Atmospheric proxy 
+    if lon is not None:
+        lst = t + pd.to_timedelta(lon / 15.0, unit="h")
+        out["lst_hour"]       = (lst.dt.hour + lst.dt.minute / 60.0).astype(float)
+        out["lst_weekday"]    = lst.dt.weekday.astype(float)
+        out["lst_is_weekend"] = (lst.dt.weekday >= 5).astype(float)
+
     pbl_candidates = [c for c in out.columns
                       if "pbl" in c.lower() or "pbh" in c.lower() or "kpbl" in c.lower()]
-    if pbl_candidates:
-        pbl_col = pbl_candidates[0]
+    pbl_col = pbl_candidates[0] if pbl_candidates else None
+    if pbl_col:
         out["pbl_proxy"] = np.log1p(out[pbl_col].clip(lower=0))
+
+    u_col = next((c for c in ("u", "u10m", "u10") if c in out.columns), None)
+    v_col = next((c for c in ("v", "v10m", "v10") if c in out.columns), None)
+    if u_col and v_col:
+        out["wind_speed"]   = np.hypot(out[u_col], out[v_col])
+        wd = np.arctan2(out[v_col], out[u_col])
+        out["wind_dir_sin"] = np.sin(wd)
+        out["wind_dir_cos"] = np.cos(wd)
+        if pbl_col:
+            out["ventilation"] = out["wind_speed"] * out[pbl_col].clip(lower=0)
 
     # surface–850 hPa temperature difference
     t2m_cols  = [c for c in out.columns if "t2m"  in c.lower() or "ts"   in c.lower()]
     t850_cols = [c for c in out.columns if "t850" in c.lower() or "t_850" in c.lower()]
     if t2m_cols and t850_cols:
         out["t2m_delta"] = out[t2m_cols[0]] - out[t850_cols[0]]
-
-    # Lagged 
-    spec_col = None
-    for candidate in [spec, f"{spec}_col", f"geos_{spec}"]:
-        if candidate in out.columns:
-            spec_col = candidate
-            break
-
-    if spec_col is None:
-        hits = [c for c in out.columns if spec.lower() in c.lower() and c != "value"]
-        if hits:
-            spec_col = hits[0]
-
-    if spec_col is not None:
-        s = out[spec_col]
-        out[f"{spec}_lag1h"]   = s.shift(1)
-        out[f"{spec}_lag3h"]   = s.shift(3)
-        out[f"{spec}_lag6h"]   = s.shift(6)
-        out[f"{spec}_lag24h"]  = s.shift(24)
-        out[f"{spec}_roll3h"]  = s.rolling(3,  min_periods=1).mean()
-        out[f"{spec}_roll6h"]  = s.rolling(6,  min_periods=1).mean()
-
-    # Fill NaN lags with column medians
-    new_cols = [c for c in out.columns if c not in df.columns]
-    for c in new_cols:
-        med = out[c].median()
-        if pd.isna(med):
-            med = 0.0
-        out[c] = out[c].fillna(med)
 
     return out
 
@@ -1095,6 +1147,7 @@ def get_localised_forecast(
     model_max_age_days: int = 7,
     obs_cache_hours: int = DEFAULT_CACHE_HOURS,
     s3_manager: S3Manager = None,
+    retrain_min_new_obs_days: int = 60,
     **kwargs,
 ):
     """
@@ -1114,7 +1167,10 @@ def get_localised_forecast(
     3. **Model lookup order**
        a. Local ``MODELS/`` folder.
        b. S3 bucket (``snwg_forecast_working_files/MODELS/``).
-       c. Train a new LightGBM model if none is found (or ``force_retrain``).
+       c. Train a new site model if none is found (or ``force_retrain``):
+          LightGBM, XGBoost or their blend, picked by time-series CV.
+       Global models are hybrid (Pandora-trained) and only considered for
+       Pandora sites; other sources use obs-based site models only.
 
     4. **Prediction** – the trained model predicts over the entire combined
        V1 + V2 GEOS-CF time series.  Small gaps (≤ 6 h) are linearly
@@ -1144,6 +1200,15 @@ def get_localised_forecast(
         file is incomplete or covers too narrow a date range.
     obs_cache_hours : int
         Pandora cache staleness threshold in hours (default: ``DEFAULT_CACHE_HOURS``).
+    retrain_min_new_obs_days : int
+        A current-recipe site model is only retrained once the observations
+        extend at least this many days past the data it was trained on
+        (default: 60). Until then the best pre-trained model is used, whatever
+        its age or R². Models from an older recipe, or built for the other
+        approach (hybrid vs obs-based), are still retrained once.
+    model_max_age_days : int
+        Kept for backward compatibility; site-model retraining is now driven
+        by new observations (``retrain_min_new_obs_days``), not model age.
     s3_manager : S3Manager, optional
         Pre-configured S3Manager.  Created automatically from ``S3_BUCKET``
         if not supplied.
@@ -1181,6 +1246,9 @@ def get_localised_forecast(
         if obs_data is None or obs_data.empty:
             print(f"ERROR: No observations loaded for {loc}")
             return None, None, None
+
+        obs_data = (obs_data.dropna(subset=["time", "value"])
+                            .groupby("time", as_index=False)["value"].mean())
 
         if not silent:
             print(f"INFO: {len(obs_data)} observations "
@@ -1234,23 +1302,62 @@ def get_localised_forecast(
 
         # compute on the full series, not the sparse obs subset, so lag
         # features mean the same thing at train time and predict time
-        geos_data_feat = _add_atmospheric_features(geos_data, spec=spec)
+        geos_data_feat = _add_atmospheric_features(geos_data, spec=spec, lon=lon)
+        all_geos = funcs.clean_feature_names(geos_data_feat.copy())
 
-        # model priority: local file, global file, s3 site, s3 global, train new
+        hybrid   = _is_hybrid_source(obs_src)
+        approach = "hybrid" if hybrid else "obs_based"
+        if not silent:
+            print(f"INFO: Approach = {approach} "
+                  f"({'GEOS-CF × learned correction factor' if hybrid else 'direct model of local observations'})")
+
         R2_MIN_THRESHOLD = 0.50
         import json as _json
 
-        model_lgb, sel_feats, metrics = None, None, {}
+        model, sel_feats, metrics = None, None, {}
         model_path, feature_path, metrics_path = _model_local_paths(loc_clean, spec)
 
         # best candidate below threshold, used if nothing clears the bar
         _best_fallback = {"model": None, "feats": None, "metrics": None, "r2": -np.inf}
+        _legacy = {}
+
+        def _is_legacy(m, feats, mets, label):
+            if (mets or {}).get("pipeline_version") == PIPELINE_VERSION:
+                return False
+            _legacy.setdefault("entry", (m, feats, mets))
+            if not silent:
+                print(f"INFO: {label} is from an older training recipe "
+                      f"(pipeline_version={(mets or {}).get('pipeline_version')}, "
+                      f"current={PIPELINE_VERSION}) — not scored, will retrain.")
+            return True
 
         def _consider_fallback(m, feats, mets, r2):
             if m is not None and r2 is not None and r2 > _best_fallback["r2"]:
                 _best_fallback.update(model=m, feats=feats, metrics=mets, r2=r2)
 
-        # Helper: load and evaluate any model file
+        def _compatible(tmode, label):
+            ok = (tmode in HYBRID_TARGETS) == hybrid
+            if not ok and not silent:
+                print(f"INFO: Ignoring {label} — target '{tmode}' does not match the "
+                      f"{approach} approach used for obs_src='{obs_src}'.")
+            return ok
+
+        _obs_end = obs_data["time"].max()
+
+        def _new_obs_days(mets):
+            """Days of observations beyond what the model was trained on.
+            Models that predate the ``obs_end`` field fall back to their
+            training date (no obs after it can have been used)."""
+            ref = (mets or {}).get("obs_end") or (mets or {}).get("trained_at")
+            try:
+                return max(0, (_obs_end - pd.Timestamp(ref)).days)
+            except (TypeError, ValueError):
+                return None
+
+        def _needs_new_data_retrain(mets):
+            d = _new_obs_days(mets)
+            return d is None or d >= retrain_min_new_obs_days
+
         def _load_and_eval(mdl_path, feat_path, met_path=None, label="model"):
             """
             Load a model + feature payload from disk.
@@ -1263,55 +1370,74 @@ def get_localised_forecast(
                 feats  = pay["features"] if isinstance(pay, dict) else pay
                 tmode  = pay.get("target", "absolute") if isinstance(pay, dict) else "absolute"
                 mets   = {"source": label, "target": tmode}
-                if met_path and os.path.exists(met_path):
+                _pm = pay.get("metrics") if isinstance(pay, dict) else None
+                if not _pm and met_path and os.path.exists(met_path):
                     try:
                         with open(met_path) as _ff:
                             _pm = _json.load(_ff)
-                        mets.update({k: _pm.get(k) for k in
-                                     ("RMSE", "R2", "MAE", "n_train", "trained_at",
-                                      "global_CV_RMSE", "global_CV_R2")})
                     except Exception:
-                        pass
+                        _pm = None
+                if _pm:
+                    mets.update({k: _pm.get(k) for k in
+                                 ("RMSE", "R2", "MAE", "CV_R2", "n_train", "trained_at",
+                                  "algorithm", "approach", "pipeline_version",
+                                  "obs_end", "per_site",
+                                  "global_CV_RMSE", "global_CV_R2")
+                                 if _pm.get(k) is not None})
                 return m, feats, tmode, mets.get("R2"), mets
             except Exception as _le:
                 if not silent:
                     print(f"WARNING: Could not load {label} from {mdl_path}: {_le}")
                 return None, None, None, None, None
 
+        _obs_by_time = obs_data.drop_duplicates("time").set_index("time")["value"]
+
         def _eval_on_obs(m, feats, tmode):
             """
-            Evaluate model *m* against obs/GEOS overlap. Returns (rmse, r2, mae).
+            Evaluate model *m* against the obs/GEOS overlap. Returns (rmse, r2, mae).
+            Note: in-sample for models that were trained on this site.
             """
             try:
-                _ev = (geos_data_feat.merge(obs_data[["time", "value"]], on="time", how="inner")
-                                .dropna(subset=["value"]))
-                if len(_ev) < 10:
+                conc = _predict_concentration(m, feats, tmode, all_geos, spec)
+                obs_v = _obs_by_time.reindex(all_geos["time"].values).values.astype(float)
+                rmse, r2, mae = _score(obs_v, conc)
+                if np.isnan(r2):
                     return None, None, None
-                _edf = funcs.clean_feature_names(_ev.copy())
-
-                def _cf(n):
-                    return funcs.clean_feature_names(pd.DataFrame(columns=[n])).columns[0]
-
-                _fc = [_cf(f) for f in feats]
-                _fa = [f for f in _fc if f in _edf.columns]
-                _X  = _edf[_fa].ffill().bfill().fillna(_edf[_fa].median())
-                for _mf in m.feature_name_:
-                    if _mf not in _X.columns:
-                        _X[_mf] = 0.0
-                _X = _X[m.feature_name_]
-                _y = _ev["value"].values
-                _rc = _cf(spec)
-                if tmode == "ratio" and _rc in _edf.columns:
-                    _p = _edf[_rc].values * np.clip(m.predict(_X), 0.05, 20.0)
-                else:
-                    _p = m.predict(_X)
-                return (float(np.sqrt(mean_squared_error(_y, _p))),
-                        float(r2_score(_y, _p)),
-                        float(mean_absolute_error(_y, _p)))
+                return rmse, r2, mae
             except Exception as _ee:
                 if not silent:
                     print(f"WARNING: Eval failed: {_ee}")
                 return None, None, None
+
+        def _score_global(gm, gf, gt, gmets, label):
+            """
+            R² of a global model for this site, comparable to a site model's
+            CV R²: the site's out-of-fold score from global training if it
+            was in the pool, else a live eval (honest, as the site is unseen).
+            Returns (r2, metrics), or (None, None) for an old-recipe global
+            model (trained on raw mol/mol GEOS-CF — its predictions are wrong).
+            """
+            if (gmets or {}).get("pipeline_version") != PIPELINE_VERSION:
+                if not silent:
+                    print(f"INFO: {label} is from an older recipe — ignored. "
+                          f"Retrain it with train_global_model_from_local().")
+                return None, None
+            mets = {k: v for k, v in gmets.items() if k != "per_site"}
+            site_r2 = (gmets.get("per_site") or {}).get(loc)
+            if site_r2 is not None and np.isfinite(site_r2):
+                mets["R2"] = site_r2
+                if not silent:
+                    print(f"INFO: {label} — out-of-fold R² for {loc} = {site_r2:.3f}")
+                return site_r2, mets
+            rmse, r2, mae = _eval_on_obs(gm, gf, gt)
+            if r2 is None:
+                return None, None
+            mets.update({"RMSE": round(rmse, 3), "R2": round(r2, 3), "MAE": round(mae, 3)})
+            if not silent:
+                print(f"INFO: {label} — {loc} not in its training pool, live eval R²={r2:.3f}")
+            return r2, mets
+
+        skip_retrain = False
 
         # step 1: local model
         local_r2 = None
@@ -1321,7 +1447,8 @@ def get_localised_forecast(
                 print(f"INFO: Found local model ({age_h:.1f}h old) → {model_path}")
             _m, _f, _t, _r2_stored, _mets = _load_and_eval(
                 model_path, feature_path, metrics_path, label="local")
-            if _m is not None:
+            if (_m is not None and _compatible(_t, "local model")
+                    and not _is_legacy(_m, _f, _mets, "Local model")):
                 # Evaluate live if stored R² is missing
                 if _r2_stored is None:
                     _rmse, _r2_live, _mae = _eval_on_obs(_m, _f, _t)
@@ -1335,23 +1462,32 @@ def get_localised_forecast(
                 else:
                     local_r2 = _r2_stored
                     if not silent:
-                        print(f"INFO: Local model stored R²={local_r2}")
+                        print(f"INFO: Local model stored R²={local_r2} "
+                              f"({_mets.get('algorithm', 'lgbm')}, target={_t})")
 
-                if local_r2 is not None and local_r2 >= R2_MIN_THRESHOLD:
-                    model_lgb, sel_feats, metrics = _m, _f, _mets
+                _new_days = _new_obs_days(_mets)
+                skip_retrain = not _needs_new_data_retrain(_mets)
+                if not silent:
+                    print(f"INFO: {_new_days if _new_days is not None else 'unknown'} days of "
+                          f"new obs since this model's training data "
+                          + ("— below the retrain threshold, keeping pre-trained models."
+                             if skip_retrain else
+                             f"(≥ {retrain_min_new_obs_days}) — will retrain."))
+
+                if local_r2 is not None and local_r2 >= R2_MIN_THRESHOLD and skip_retrain:
+                    model, sel_feats, metrics = _m, _f, _mets
                     if not silent:
                         print(f"INFO: Local model accepted (R²={local_r2:.3f} ≥ {R2_MIN_THRESHOLD}).")
                 else:
                     _consider_fallback(_m, _f, _mets, local_r2)
-                    if not silent:
-                        print(f"WARNING: Local model rejected "
+                    if not silent and (local_r2 is None or local_r2 < R2_MIN_THRESHOLD):
+                        print(f"WARNING: Local model below threshold "
                               f"(R²={local_r2 if local_r2 is not None else 'unknown'} "
-                              f"< {R2_MIN_THRESHOLD}) — will check global.")
+                              f"< {R2_MIN_THRESHOLD}).")
 
         elif not force_retrain and not silent:
             print(f"INFO: No local pre-trained model found at {model_path}")
 
-        # step 2: global model
         GLOBAL_TAG          = "global"
         # Preferred path: species-specific named model e.g. global_no2_model.joblib
         _glob_named_path    = os.path.join(MODELS_LOCAL_DIR, f"global_{spec}_model.joblib")
@@ -1363,18 +1499,19 @@ def get_localised_forecast(
         _glob_std_metrics   = os.path.join(MODELS_LOCAL_DIR, f"lgbm_{GLOBAL_TAG}_{spec}_metrics.json")
 
         # Pick whichever global file exists (named preferred)
-        if os.path.exists(_glob_named_path) and os.path.exists(_glob_named_feats):
+        _gpath = None
+        if not hybrid:
+            if not silent:
+                print(f"INFO: Skipping global models (hybrid, Pandora-trained) for obs-based source.")
+        elif os.path.exists(_glob_named_path) and os.path.exists(_glob_named_feats):
             _gpath, _gfpath, _gmpath = _glob_named_path, _glob_named_feats, _glob_named_metrics
             _glabel = f"global_pretrained ({os.path.basename(_glob_named_path)})"
         elif os.path.exists(_glob_std_path) and os.path.exists(_glob_std_feats):
             _gpath, _gfpath, _gmpath = _glob_std_path, _glob_std_feats, _glob_std_metrics
             _glabel = f"global_standard ({os.path.basename(_glob_std_path)})"
-        else:
-            _gpath = None
 
-        global_model_lgb = None
+        global_model     = None
         global_sel_feats = None
-        global_target    = "absolute"
         global_r2        = None
         global_metrics   = {}
 
@@ -1383,39 +1520,27 @@ def get_localised_forecast(
                 print(f"INFO: Found global model → {_gpath}")
             _gm, _gf, _gt, _gr2_stored, _gmets = _load_and_eval(
                 _gpath, _gfpath, _gmpath, label=_glabel)
-            if _gm is not None:
-                global_model_lgb = _gm
-                global_sel_feats = _gf
-                global_target    = _gt
-                global_metrics   = _gmets
-                # Always evaluate live so we compare on the same data
-                _g_rmse, _g_r2_live, _g_mae = _eval_on_obs(_gm, _gf, _gt)
-                if _g_r2_live is not None:
-                    global_r2 = _g_r2_live
-                    global_metrics.update({"RMSE": round(_g_rmse, 3),
-                                           "R2":   round(_g_r2_live, 3),
-                                           "MAE":  round(_g_mae, 3)})
-                    if not silent:
-                        print(f"INFO: Global model live eval — R²={_g_r2_live:.3f}  RMSE={_g_rmse:.3f}")
-                else:
-                    global_r2 = _gr2_stored
-                    if not silent:
-                        print(f"INFO: Global model stored R²={_gr2_stored}")
+            if _gm is not None and _compatible(_gt, "global model"):
+                global_r2, _gscored = _score_global(_gm, _gf, _gt, _gmets, "Global model")
+                if _gscored is not None:
+                    global_model     = _gm
+                    global_sel_feats = _gf
+                    global_metrics   = _gscored
 
         # Decide: switch to global?
-        if global_model_lgb is not None:
-            _consider_fallback(global_model_lgb, global_sel_feats, global_metrics, global_r2)
-            local_ok  = model_lgb is not None and local_r2 is not None and local_r2 >= R2_MIN_THRESHOLD
+        if global_model is not None:
+            _consider_fallback(global_model, global_sel_feats, global_metrics, global_r2)
+            local_ok  = model is not None and local_r2 is not None and local_r2 >= R2_MIN_THRESHOLD
             global_ok = global_r2 is not None and global_r2 >= R2_MIN_THRESHOLD
 
             if global_ok and (not local_ok or global_r2 > (local_r2 or -np.inf)):
                 reason = (
-                    "no local model" if model_lgb is None
+                    "no local model" if model is None
                     else f"global R²={global_r2:.3f} > local R²={local_r2:.3f}"
                 )
                 if not silent:
                     print(f"INFO: Using global model ({reason}).")
-                model_lgb  = global_model_lgb
+                model      = global_model
                 sel_feats  = global_sel_feats
                 metrics    = global_metrics
             elif local_ok:
@@ -1424,43 +1549,49 @@ def get_localised_forecast(
                           f"(local R²={local_r2:.3f} ≥ {R2_MIN_THRESHOLD} "
                           f"and ≥ global R²={global_r2}).")
             else:
-                model_lgb = None
+                model = None
                 if not silent:
                     print(f"INFO: Local R²={local_r2} and global R²={global_r2} both "
-                          f"< {R2_MIN_THRESHOLD} — continuing search (S3 model / retrain).")
+                          f"< {R2_MIN_THRESHOLD} — continuing search.")
 
-        # step 3: s3 site model
-        if model_lgb is None and not force_retrain:
+        if model is None and not force_retrain and not skip_retrain:
             if not silent:
-                print(f"INFO: No local/global model — checking S3 for site-specific model…")
+                print(f"INFO: Checking S3 for site-specific model…")
             _s3m, _s3pay, _s3mets = _try_load_model_from_s3(
                 loc_clean, spec, s3_manager, silent=silent)
             if _s3m is not None:
                 _s3f  = _s3pay["features"] if isinstance(_s3pay, dict) else _s3pay
                 _s3t  = _s3pay.get("target", "absolute") if isinstance(_s3pay, dict) else "absolute"
-                _s3rm, _s3r2, _s3ma = _eval_on_obs(_s3m, _s3f, _s3t)
-                if not silent:
-                    print(f"INFO: S3 site model eval — R²={_s3r2}  RMSE={_s3rm}")
-                _s3_metrics = {"source": "s3", "target": _s3t,
-                               "RMSE": round(_s3rm, 3) if _s3rm is not None else None,
-                               "R2":   round(_s3r2, 3) if _s3r2 is not None else None,
-                               "MAE":  round(_s3ma, 3) if _s3ma is not None else None}
-                if _s3mets:
-                    _s3_metrics.update({k: _s3mets.get(k)
-                                        for k in ("n_train", "trained_at")})
-                if _s3r2 is not None and _s3r2 >= R2_MIN_THRESHOLD:
-                    model_lgb = _s3m
-                    sel_feats = _s3f
-                    metrics   = _s3_metrics
+                _s3own = _s3pay.get("metrics") if isinstance(_s3pay, dict) else None
+                if (_compatible(_s3t, "S3 site model")
+                        and not _is_legacy(_s3m, _s3f,
+                                           dict(_s3own or _s3mets or {}, source="s3", target=_s3t),
+                                           "S3 site model")):
+                    if _s3own and _s3own.get("R2") is not None:
+                        _s3_metrics = dict(_s3own, source="s3", target=_s3t)
+                        _s3r2 = _s3own["R2"]
+                    else:
+                        _s3rm, _s3r2, _s3ma = _eval_on_obs(_s3m, _s3f, _s3t)
+                        _s3_metrics = {"source": "s3", "target": _s3t,
+                                       "RMSE": round(_s3rm, 3) if _s3rm is not None else None,
+                                       "R2":   round(_s3r2, 3) if _s3r2 is not None else None,
+                                       "MAE":  round(_s3ma, 3) if _s3ma is not None else None}
+                        if _s3mets:
+                            _s3_metrics.update({k: _s3mets.get(k)
+                                                for k in ("n_train", "trained_at")})
                     if not silent:
-                        print(f"INFO: S3 site model accepted (R²={_s3r2:.3f}).")
-                else:
-                    _consider_fallback(_s3m, _s3f, _s3_metrics, _s3r2)
-                    if not silent:
-                        print(f"WARNING: S3 site model rejected (R²={_s3r2}).")
+                        print(f"INFO: S3 site model — R²={_s3r2 if _s3r2 is None else round(_s3r2, 3)}")
+                    skip_retrain = not _needs_new_data_retrain(_s3_metrics)
+                    if _s3r2 is not None and _s3r2 >= R2_MIN_THRESHOLD and skip_retrain:
+                        model, sel_feats, metrics = _s3m, _s3f, _s3_metrics
+                        if not silent:
+                            print(f"INFO: S3 site model accepted (R²={_s3r2:.3f}).")
+                    else:
+                        _consider_fallback(_s3m, _s3f, _s3_metrics, _s3r2)
+                        if not silent:
+                            print(f"WARNING: S3 site model below threshold (R²={_s3r2 if _s3r2 is None else round(_s3r2, 3)}).")
 
-        # step 4: s3 global model
-        if model_lgb is None and not force_retrain:
+        if model is None and not force_retrain and hybrid:
             if not silent:
                 print(f"INFO: Checking S3 for global model…")
             os.makedirs(MODELS_LOCAL_DIR, exist_ok=True)
@@ -1474,302 +1605,71 @@ def get_localised_forecast(
                  f"{S3_MODELS_PREFIX}/lgbm_{GLOBAL_TAG}_{spec}_features_basic.pkl",
                  _glob_std_feats),
             ]:
-                if model_lgb is not None:
+                if model is not None:
                     break
+                if global_model is not None and _local_dst == _gpath:
+                    continue
                 try:
                     _got_m = s3_manager.download_file(_s3_key,  _local_dst)
                     _got_f = s3_manager.download_file(_s3_fkey, _local_fdst)
                     if _got_m and _got_f:
-                        _gm2, _gf2, _gt2, _, _ = _load_and_eval(
+                        _gm2, _gf2, _gt2, _, _g2mets = _load_and_eval(
                             _local_dst, _local_fdst, label="s3_global")
-                        if _gm2 is not None:
-                            _gr2, _gr2v, _gma = _eval_on_obs(_gm2, _gf2, _gt2)
-                            if not silent:
-                                print(f"INFO: S3 global model eval — R²={_gr2v}  RMSE={_gr2}")
-                            _g4_metrics = {"source": "s3_global", "target": _gt2,
-                                           "RMSE": round(_gr2, 3) if _gr2 is not None else None,
-                                           "R2":   round(_gr2v, 3) if _gr2v is not None else None,
-                                           "MAE":  round(_gma, 3) if _gma is not None else None}
+                        if _gm2 is not None and _compatible(_gt2, "S3 global model"):
+                            _gr2v, _g4_metrics = _score_global(_gm2, _gf2, _gt2, _g2mets,
+                                                               "S3 global model")
+                            if _g4_metrics is None:
+                                continue
+                            _g4_metrics["source"] = "s3_global"
                             _consider_fallback(_gm2, _gf2, _g4_metrics, _gr2v)
                             if _gr2v is not None and _gr2v >= R2_MIN_THRESHOLD:
-                                model_lgb = _gm2
-                                sel_feats = _gf2
-                                metrics   = _g4_metrics
+                                model, sel_feats, metrics = _gm2, _gf2, _g4_metrics
                             elif not silent:
-                                print(f"WARNING: S3 global model rejected (R²={_gr2v}) — will retrain.")
+                                print(f"WARNING: S3 global model below threshold (R²={_gr2v}).")
                 except Exception:
                     pass
 
         # step 5: train new model, last resort
-        if model_lgb is None:
+        if model is None and not skip_retrain:
             if not silent:
-                print(f"INFO: Training new model for {loc}…")
+                print(f"INFO: Training new {approach} model for {loc}…")
 
             merged_train = (
                 geos_data_feat.merge(obs_data[["time", "value"]], on="time", how="inner")
                               .dropna(subset=["value"])
             )
-
             if not silent:
                 print(f"INFO: Training samples after merge: {len(merged_train)}")
 
-            if len(merged_train) < 50:
-                print(f"ERROR: Insufficient training data ({len(merged_train)} samples)")
-                return None, None, None
+            _new_m, _new_f, _new_mets = _train_site_model(
+                merged_train, spec, hybrid=hybrid, rmv_out=rmv_out, silent=silent)
 
-            # Features (already engineered on the full geos_data_feat above)
-            if not silent:
-                new_feat_count = len([c for c in merged_train.columns
-                                      if c not in geos_data.columns and c != "value"])
-                print(f"INFO: {new_feat_count} engineered features added "
-                      f"(cyclical time, atmospheric proxies, lags)")
-
-            # obs / geos_raw
-    
-            raw_col = spec 
-            if raw_col not in merged_train.columns:
-
-                hits = [c for c in merged_train.columns
-                        if spec.lower() in c.lower() and c != "value"]
-                if hits:
-                    raw_col = hits[0]
-
-            if raw_col in merged_train.columns:
-                raw_vals = merged_train[raw_col].replace(0, np.nan)
-                merged_train["bias_ratio"] = (merged_train["value"] / raw_vals).clip(0.05, 20.0)
-                merged_train = merged_train.dropna(subset=["bias_ratio"])
-                yvar = "bias_ratio"
-                target_mode = "ratio"
-                if not silent:
-                    print(f"INFO: Target mode = bias ratio (obs / {raw_col})  "
-                          f"median ratio = {merged_train['bias_ratio'].median():.3f}")
-            else:
-
-                yvar = "value"
-                target_mode = "absolute"
-                if not silent:
-                    print(f"WARNING: Raw GEOS-CF column '{spec}' not found — "
-                          f"falling back to absolute prediction")
-
-            skip      = {"time", "location", "lat", "lon", "value", "bias_ratio"}
-            num_cols  = merged_train.select_dtypes(include=[np.number]).columns.tolist()
-            sel_feats = [c for c in num_cols if c not in skip]
-
-            if rmv_out:
-                conc = merged_train[yvar].values.reshape(-1, 1)
-                clf  = IForest(contamination=0.02)
-                clf.fit(conc)
-                mask = clf.predict(conc) != 1
-                if not silent:
-                    print(f"INFO: Outlier removal: {(~mask).sum()} removed, "
-                          f"{mask.sum()} remaining")
-                merged_train = merged_train[mask]
-
-            merged_train = merged_train.sort_values("time").reset_index(drop=True)
-
-            # cross-validation
-            n_splits = min(5, max(2, len(merged_train) // 500))
-            tscv     = TimeSeriesSplit(n_splits=n_splits)
-            fold_rmses, fold_r2s, fold_maes = [], [], []
-
-            X_all_raw, y_all_raw = funcs.clean_data(merged_train[sel_feats],
-                                                     merged_train[yvar])
-            X_all = funcs.clean_feature_names(X_all_raw)
-            y_all = y_all_raw.values
-
-            if not silent:
-                print(f"INFO: Time-series CV with {n_splits} folds "
-                      f"({len(merged_train)} samples, target={yvar})…")
-
-            for fold, (tr_idx, val_idx) in enumerate(tscv.split(X_all), 1):
-                tx, ty = X_all.iloc[tr_idx], y_all[tr_idx]
-                vx, vy = X_all.iloc[val_idx], y_all[val_idx]
-
-                _m = lgb.LGBMRegressor(
-                    n_estimators=500, max_depth=5,
-                    learning_rate=0.03, num_leaves=31,
-                    subsample=0.8, colsample_bytree=0.8,
-                    min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1,
-                    verbosity=-1, random_state=42,
-                )
-                _m.fit(tx, ty,
-                       eval_set=[(vx, vy)],
-                       callbacks=[lgb.early_stopping(50, verbose=False),
-                                  lgb.log_evaluation(-1)])
-
-                pv = _m.predict(vx)
-
-                if target_mode == "ratio" and raw_col in merged_train.columns:
-                    raw_v = merged_train[raw_col].iloc[val_idx].values
-                    vy_obs = merged_train["value"].iloc[val_idx].values
-                    pv_obs = raw_v * np.clip(pv, 0.05, 20.0)
+            if _new_m is not None:
+                cv_r2 = _new_mets["CV_R2"]
+                _save_model(_new_m, _new_f, loc_clean, spec, s3_manager, silent=silent,
+                            target_mode=_new_mets["target"], metrics=_new_mets)
+                if cv_r2 >= R2_MIN_THRESHOLD:
+                    model, sel_feats, metrics = _new_m, _new_f, _new_mets
                 else:
-                    vy_obs, pv_obs = vy, pv
-
-                fold_rmses.append(np.sqrt(mean_squared_error(vy_obs, pv_obs)))
-                fold_r2s.append(r2_score(vy_obs, pv_obs))
-                fold_maes.append(mean_absolute_error(vy_obs, pv_obs))
-                if not silent:
-                    print(f"  Fold {fold}/{n_splits}: "
-                          f"RMSE={fold_rmses[-1]:.3f}  "
-                          f"R²={fold_r2s[-1]:.3f}  "
-                          f"MAE={fold_maes[-1]:.3f}  "
-                          f"(val n={len(val_idx)})")
-
-            cv_rmse = round(float(np.mean(fold_rmses)), 3)
-            cv_r2   = round(float(np.mean(fold_r2s)),   3)
-            cv_mae  = round(float(np.mean(fold_maes)),  3)
-            if not silent:
-                print(f"INFO: CV summary → "
-                      f"RMSE={cv_rmse}±{np.std(fold_rmses):.3f}  "
-                      f"R²={cv_r2}±{np.std(fold_r2s):.3f}  "
-                      f"MAE={cv_mae}±{np.std(fold_maes):.3f}")
-
-            # quality gate: if cv r² is below threshold, try to improve
-
-            R2_MIN_THRESHOLD = 0.50
-            if cv_r2 < R2_MIN_THRESHOLD:
-                if not silent:
-                    print(f"WARNING: CV R²={cv_r2:.3f} < {R2_MIN_THRESHOLD} — "
-                          f"attempting improved hyperparameter search …")
-                # Try stronger regularisation and deeper trees
-                best_r2   = cv_r2
-                best_Xall = X_all
-                best_yall = y_all
-                best_cfg  = None
-
-                _search_cfgs = [
-                    dict(n_estimators=800, max_depth=7, learning_rate=0.02,
-                         num_leaves=63, subsample=0.7, colsample_bytree=0.7,
-                         min_child_samples=30, reg_alpha=0.3, reg_lambda=0.3),
-                    dict(n_estimators=1000, max_depth=6, learning_rate=0.01,
-                         num_leaves=31, subsample=0.8, colsample_bytree=0.8,
-                         min_child_samples=50, reg_alpha=0.5, reg_lambda=0.5),
-                    dict(n_estimators=600, max_depth=8, learning_rate=0.05,
-                         num_leaves=127, subsample=0.9, colsample_bytree=0.9,
-                         min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1),
-                ]
-                for _cfg in _search_cfgs:
-                    _r2s_tmp = []
-                    for _tr_i, _val_i in tscv.split(X_all):
-                        _mt = lgb.LGBMRegressor(**_cfg, verbosity=-1, random_state=42)
-                        _mt.fit(X_all.iloc[_tr_i], y_all[_tr_i],
-                                eval_set=[(X_all.iloc[_val_i], y_all[_val_i])],
-                                callbacks=[lgb.early_stopping(50, verbose=False),
-                                           lgb.log_evaluation(-1)])
-                        _pv = _mt.predict(X_all.iloc[_val_i])
-                        if target_mode == "ratio" and raw_col in merged_train.columns:
-                            _rv = merged_train[raw_col].iloc[_val_i].values
-                            _vy = merged_train["value"].iloc[_val_i].values
-                            _pv_obs = _rv * np.clip(_pv, 0.05, 20.0)
-                        else:
-                            _vy, _pv_obs = y_all[_val_i], _pv
-                        _r2s_tmp.append(r2_score(_vy, _pv_obs))
-                    _mean_r2 = float(np.mean(_r2s_tmp))
-                    if _mean_r2 > best_r2:
-                        best_r2  = _mean_r2
-                        best_cfg = _cfg
-                        if not silent:
-                            print(f"  Improved R²={best_r2:.3f} with cfg={_cfg}")
-
-                if best_cfg is not None:
-                    # Re-run full CV with the best config to get consistent metrics
-                    fold_rmses2, fold_r2s2, fold_maes2 = [], [], []
-                    for _tr_i, _val_i in tscv.split(X_all):
-                        _mt = lgb.LGBMRegressor(**best_cfg, verbosity=-1, random_state=42)
-                        _mt.fit(X_all.iloc[_tr_i], y_all[_tr_i],
-                                eval_set=[(X_all.iloc[_val_i], y_all[_val_i])],
-                                callbacks=[lgb.early_stopping(50, verbose=False),
-                                           lgb.log_evaluation(-1)])
-                        _pv = _mt.predict(X_all.iloc[_val_i])
-                        if target_mode == "ratio" and raw_col in merged_train.columns:
-                            _rv = merged_train[raw_col].iloc[_val_i].values
-                            _vy = merged_train["value"].iloc[_val_i].values
-                            _pv_obs = _rv * np.clip(_pv, 0.05, 20.0)
-                        else:
-                            _vy, _pv_obs = y_all[_val_i], _pv
-                        fold_rmses2.append(np.sqrt(mean_squared_error(_vy, _pv_obs)))
-                        fold_r2s2.append(r2_score(_vy, _pv_obs))
-                        fold_maes2.append(mean_absolute_error(_vy, _pv_obs))
-                    cv_rmse = round(float(np.mean(fold_rmses2)), 3)
-                    cv_r2   = round(float(np.mean(fold_r2s2)),   3)
-                    cv_mae  = round(float(np.mean(fold_maes2)),  3)
                     if not silent:
-                        print(f"INFO: Best CV after search → R²={cv_r2}  RMSE={cv_rmse}  MAE={cv_mae}")
-                    # Store best config for final model below
-                    _final_lgb_params = best_cfg
-                else:
-                    _final_lgb_params = None
-            else:
-                _final_lgb_params = None
-
-            # Final model
-            if not silent:
-                print(f"INFO: Fitting final model on all {len(X_all)} samples…")
-
-            _base_params = dict(
-                n_estimators=500, max_depth=5,
-                learning_rate=0.03, num_leaves=31,
-                subsample=0.8, colsample_bytree=0.8,
-                min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1,
-                verbosity=-1, random_state=42,
-            )
-            if _final_lgb_params:
-                _base_params.update(_final_lgb_params)
-
-            model_lgb = lgb.LGBMRegressor(**_base_params)
-            model_lgb.fit(X_all, y_all)
-
-            # In-sample obs-space R² for sanity check
-            train_ratio_preds = model_lgb.predict(X_all)
-            if target_mode == "ratio" and raw_col in merged_train.columns:
-                train_obs_preds = (merged_train[raw_col].values *
-                                   np.clip(train_ratio_preds, 0.05, 20.0))
-                train_obs_true  = merged_train["value"].values
-            else:
-                train_obs_preds = train_ratio_preds
-                train_obs_true  = y_all
-
-            metrics = {
-                "CV_RMSE":    cv_rmse,
-                "CV_R2":      cv_r2,
-                "CV_MAE":     cv_mae,
-                "RMSE":       cv_rmse,
-                "R2":         cv_r2,
-                "MAE":        cv_mae,
-                "Train_R2":   round(r2_score(train_obs_true, train_obs_preds), 3),
-                "n_folds":    n_splits,
-                "n_train":    len(merged_train),
-                "trained_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "target":     target_mode,
-                "source":     "trained",
-            }
-            if not silent:
-                print(f"INFO: Final Train R²={metrics['Train_R2']}  "
-                      f"CV R²={cv_r2}  CV RMSE={cv_rmse}  target={target_mode}")
-
-            # Only persist model if it meets the quality threshold
-            if cv_r2 >= R2_MIN_THRESHOLD:
-                _save_model(model_lgb, sel_feats, loc_clean, spec,
-                            s3_manager, silent=silent, target_mode=target_mode, metrics=metrics)
-            else:
-                if not silent:
-                    print(f"WARNING: Freshly trained local model still has CV R²={cv_r2:.3f} < "
-                          f"{R2_MIN_THRESHOLD} — will attempt global model fallback, "
-                          f"NOT saving this model.")
-                _consider_fallback(model_lgb, sel_feats, metrics, cv_r2)
-                # Mark model_lgb as None so global fallback takes over below
-                model_lgb = None
+                        print(f"WARNING: New model CV R²={cv_r2:.3f} < {R2_MIN_THRESHOLD} "
+                              f"— comparing with other candidates.")
+                    _consider_fallback(_new_m, _new_f, _new_mets, cv_r2)
 
         # nothing cleared the threshold, use the best candidate seen
-        if model_lgb is None:
-            if _best_fallback["model"] is not None:
+        if model is None:
+            if _best_fallback["model"] is None and _legacy:
+                _lm, _lf, _lmets = _legacy["entry"]
+                if not silent:
+                    print(f"WARNING: No current-recipe model available — serving legacy model.")
+                model, sel_feats, metrics = _lm, _lf, _lmets
+            elif _best_fallback["model"] is not None:
                 if not silent:
                     print(f"INFO: No candidate met R²≥{R2_MIN_THRESHOLD} — using best "
                           f"available fallback (source="
                           f"{_best_fallback['metrics'].get('source')}, "
                           f"R²={_best_fallback['r2']:.3f}).")
-                model_lgb = _best_fallback["model"]
+                model     = _best_fallback["model"]
                 sel_feats = _best_fallback["feats"]
                 metrics   = _best_fallback["metrics"]
             else:
@@ -1781,82 +1681,29 @@ def get_localised_forecast(
 
         # Predict
         if not silent:
-            print(f"INFO: Predicting over {len(geos_data)} GEOS-CF rows…")
+            print(f"INFO: Predicting over {len(all_geos)} GEOS-CF rows…")
 
-        # reuse features from above so lags match training time
-        all_geos = funcs.clean_feature_names(geos_data_feat.copy())
-
- 
-        def _clean_feat(name: str) -> str:
-            tmp = pd.DataFrame(columns=[name])
-            return funcs.clean_feature_names(tmp).columns[0]
-
-        sel_feats_clean = [_clean_feat(f) for f in sel_feats]
-        sel_feats_avail = [f for f in sel_feats_clean if f in all_geos.columns]
-
-        if not silent:
-            print(f"INFO: {len(sel_feats_avail)}/{len(sel_feats_clean)} "
-                  f"features available for prediction")
-
-        if not sel_feats_avail:
+        model_features = _model_feature_names(model) or [_clean_name(f) for f in sel_feats]
+        missing = [f for f in model_features if f not in all_geos.columns]
+        if len(missing) == len(model_features):
             print(f"ERROR: No model features found in GEOS-CF data")
             return None, None, None
-
-        all_geos["localised"] = np.nan
-
-        # Diagnostics
-        null_counts = all_geos[sel_feats_avail].isnull().sum()
-        null_feats  = null_counts[null_counts > 0]
         if not silent:
-            print(f"INFO: NaN counts per feature (non-zero only):\n{null_feats.to_string() if not null_feats.empty else '  none'}")
-            print(f"INFO: Rows with ALL features present: "
-                  f"{all_geos[sel_feats_avail].notnull().all(axis=1).sum()} / {len(all_geos)}")
+            print(f"INFO: {len(model_features) - len(missing)}/{len(model_features)} "
+                  f"features available for prediction"
+                  + (f" (missing → NaN: {missing})" if missing else ""))
 
-        # drop fully-nan features
-        all_nan_feats = [f for f in sel_feats_avail
-                         if all_geos[f].isnull().all()]
-        if all_nan_feats:
-            print(f"WARNING: Dropping {len(all_nan_feats)} fully-NaN features: {all_nan_feats}")
-            sel_feats_avail = [f for f in sel_feats_avail if f not in all_nan_feats]
+        target_mode = metrics.get("target", "absolute")
+        preds = _predict_concentration(model, sel_feats, target_mode, all_geos, spec)
+        all_geos["localised"] = preds
 
-        # Forward-fill then backward-fill sparse features
-        pred_df = all_geos[sel_feats_avail].copy()
-        pred_df = pred_df.ffill().bfill()
-        col_medians = pred_df.median()
-        pred_df = pred_df.fillna(col_medians)
-
-        valid_mask = pred_df.notnull().all(axis=1)
-        if not silent:
-            print(f"INFO: Valid rows after fill: {valid_mask.sum()} / {len(all_geos)}")
-
-        if valid_mask.sum() > 0:
-            X_pred = pred_df.loc[valid_mask, sel_feats_avail].copy()
-            model_features = list(model_lgb.feature_name_)
-            for feat in model_features:
-                if feat not in X_pred.columns:
-                    X_pred[feat] = 0.0
-            X_pred = X_pred[model_features]
-            raw_preds = model_lgb.predict(X_pred)
-
-            # If model was trained on bias ratio, convert back to concentrations
-            target_mode = metrics.get("target", "absolute")
-            raw_col_clean = _clean_feat(spec)
-            if target_mode == "ratio" and raw_col_clean in all_geos.columns:
-                raw_conc = all_geos.loc[valid_mask, raw_col_clean].values
-                preds = raw_conc * np.clip(raw_preds, 0.05, 20.0)
-                if not silent:
-                    print(f"INFO: ratio mode — median correction factor: "
-                          f"{np.nanmedian(np.clip(raw_preds, 0.05, 20.0)):.3f}")
-            else:
-                preds = raw_preds
-
-            all_geos.loc[valid_mask, "localised"] = preds
-            if not silent:
-                print(f"INFO: {len(preds)} predictions "
-                      f"({np.nanmin(preds):.2f} – {np.nanmax(preds):.2f})")
-        else:
+        n_valid = int(np.isfinite(preds).sum())
+        if n_valid == 0:
             print(f"ERROR: No valid rows for prediction")
             return None, None, None
+        if not silent:
+            print(f"INFO: {n_valid}/{len(all_geos)} predictions "
+                  f"({np.nanmin(preds):.2f} – {np.nanmax(preds):.2f}), target={target_mode}")
 
         # Interpolate
         n_before = all_geos["localised"].isna().sum()
@@ -1883,7 +1730,7 @@ def get_localised_forecast(
         print(f"INFO: Model performance for {loc} ({spec.upper()}): "
               f"{_format_metrics_summary(metrics)}")
 
-        return result, metrics, model_lgb
+        return result, metrics, model
 
     except Exception as exc:
         print(f"ERROR: Forecast generation failed for {loc}: {exc}")

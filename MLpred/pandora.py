@@ -153,8 +153,14 @@ def read_pandora(
         print(f"Downloading {pollutant.upper()} data for '{_site_from_url(url)}'")
 
     api_url = _pandora_bulk_l2_url(url, start=start, end=end)
-    response = requests.get(api_url)
-    response.raise_for_status()
+    try:
+        response = requests.get(api_url)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        if cache and os.path.exists(cache_file):
+            print(f"WARNING: Pandora download failed ({exc}) — using stale cache {cache_file}")
+            return pd.read_csv(cache_file, parse_dates=["time"])
+        raise
     content = response.text
 
     metadata = extract_metadata(content)

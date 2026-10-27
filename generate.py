@@ -43,6 +43,8 @@ parser.add_argument('--plot-full-history', action='store_true', default=False,
                     help='Also plot corrected vs. estimated NO2 over the full GEOS-CF period')
 parser.add_argument('--full-history-resample', type=str, default='7D', metavar='FREQ',
                     help='Resample frequency for the full-history plot (default: 7D)')
+parser.add_argument('--force-retrain', action='store_true', default=False,
+                    help='Skip local/S3 pre-trained models and always train fresh')
 args = parser.parse_args()
 
 # Config
@@ -126,7 +128,7 @@ if CLEAN_LOCAL:
 
 # Locations
 url = "https://raw.githubusercontent.com/noussairlazrak/MLpred/refs/heads/main/global.json"
-config_msg = f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}, STALE_HOURS={STALE_HOURS}, FORCE_SOURCES={FORCE_SOURCES}, SKIP_SOURCES={SKIP_SOURCES}, PLOT_FULL_HISTORY={PLOT_FULL_HISTORY}"
+config_msg = f"Config: SKIP_PLOTTING={SKIP_PLOTTING}, SKIP_OPENAQ={SKIP_OPENAQ}, S3_ONLY={S3_ONLY}, CLEAN_LOCAL={CLEAN_LOCAL}, NO_LOCAL_SAVE={NO_LOCAL_SAVE}, MODEL_CACHE_SOURCE={MODEL_CACHE_SOURCE}, STALE_HOURS={STALE_HOURS}, FORCE_SOURCES={FORCE_SOURCES}, SKIP_SOURCES={SKIP_SOURCES}, PLOT_FULL_HISTORY={PLOT_FULL_HISTORY}, FORCE_RETRAIN={args.force_retrain}"
 if LOCATION_FILTER:
     config_msg += f", LOCATION_FILTER={len(LOCATION_FILTER)} locations"
 print(config_msg)
@@ -330,7 +332,7 @@ for key, location_data in list(data.items()):
                     lat_col=obs_settings['lat_col'],
                     lon_col=obs_settings['lon_col'],
                     silent=site_settings['silent'],
-                    force_retrain=False,    
+                    force_retrain=args.force_retrain,
                     force_obs_refresh=False,
                     model_max_age_days=7,  
                     s3_manager=s3_manager,
@@ -349,7 +351,7 @@ for key, location_data in list(data.items()):
                 metadata = metrics
                 if metrics:
                     perf_bits = [f"{k}={metrics[k]}" for k in
-                                 ("source", "target", "R2", "RMSE", "MAE",
+                                 ("source", "approach", "algorithm", "target", "R2", "RMSE", "MAE",
                                   "CV_R2", "CV_RMSE", "CV_MAE", "Train_R2", "n_train")
                                  if metrics.get(k) is not None]
                     print(f"Model performance for {locname}: "
