@@ -5,7 +5,8 @@ sys.path.insert(1,'MLpred')
 import os
 from MLpred import mlpred
 from MLpred import funcs
-from MLpred.bias_corrector import get_localised_forecast
+from MLpred.bias_corrector import get_localised_forecast, PIPELINE_VERSION
+from MLpred.run_report import RunReport
 from MLpred.s3_manager import S3Manager
 from MLpred.geos_fp_cnn import read_geos_fp_cnn, load_geojson_all_locations
 from MLpred.alerts import alert_read_failure, alert_no_new_data
@@ -17,7 +18,8 @@ import json
 import boto3
 import traceback
 import argparse
-import joblib 
+import atexit
+import joblib
 
 # Arguments
 parser = argparse.ArgumentParser(description='Generate and upload forecasts to S3')
@@ -133,6 +135,16 @@ if LOCATION_FILTER:
     config_msg += f", LOCATION_FILTER={len(LOCATION_FILTER)} locations"
 print(config_msg)
 data = json.loads(requests.get(url, stream=True).text)
+
+REPORTS_DIR = "./reports"
+REPORTS_S3_PREFIX = "snwg_forecast_working_files/reports"
+run_report = RunReport(config=vars(args), pipeline_version=PIPELINE_VERSION)
+
+def finalize_run_report():
+    run_report.finalize(out_dir=REPORTS_DIR, s3_manager=s3_manager,
+                        s3_prefix=REPORTS_S3_PREFIX, clean_local=CLEAN_LOCAL)
+
+atexit.register(finalize_run_report)
 all_locations = [] 
 
 # Pre-check
@@ -177,6 +189,7 @@ for key, location_data in list(data.items()):
             continue
         
         print(f"\nProcessing: {locname} (lat: {lat}, lon: {lon})")
+        run_report.add_location(locname, lat=lat, lon=lon, obs_source=obs_source)
 
         force_this = FORCE_UPDATE or (obs_source in FORCE_SOURCES)
 
@@ -191,10 +204,14 @@ for key, location_data in list(data.items()):
                     if s3_manager.file_exists(s3_key) and s3_manager.is_file_recent(s3_key, hours_threshold=STALE_HOURS):
                         age = s3_manager.get_file_age_hours(s3_key)
                         print(f"Skipping {locname} - recent ({age:.1f}h old)")
+                        run_report.add_event(locname, "skipped", f"recent forecast on S3 ({age:.1f}h old)",
+                                             obs_source=obs_source)
                         continue
                 else:
                     if funcs.is_forecast_recent(site_file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
                         print(f"Skipping {locname} - recent")
+                        run_report.add_event(locname, "skipped", "recent local forecast",
+                                             obs_source=obs_source)
                         continue
                 
             # Settings
@@ -223,20 +240,28 @@ for key, location_data in list(data.items()):
                 }
                 
                 # Save
+                n_rows = len(forecast_dict["forecasts"]) if hasattr(forecast_dict["forecasts"], "__len__") else None
                 if NO_LOCAL_SAVE:
                     if s3_manager.upload_json(forecast_dict, s3_key):
                         print(f"PM2.5 forecast for {locname} saved to S3")
+                        run_report.add_output(locname, ["pm25"], s3_key=s3_key, variant="recent",
+                                              n_rows=n_rows, sources=forecast_dict["sources"])
                     else:
                         print(f"Failed to save PM2.5 forecast for {locname}")
+                        run_report.add_event(locname, "failed", "PM2.5 forecast upload to S3 failed",
+                                             spec="pm25", obs_source=obs_source)
                 else:
                     try:
                         with open(site_file_path, 'w') as f:
                             json.dump(forecast_dict, f, indent=2, default=str)
                         print(f"PM2.5 forecast for {locname} saved locally")
-                        
+
                         # Upload
                         s3_manager.upload_file(site_file_path, s3_key)
                         print(f"PM2.5 forecast for {locname} uploaded to S3")
+                        run_report.add_output(locname, ["pm25"], path=site_file_path, s3_key=s3_key,
+                                              variant="recent", n_rows=n_rows,
+                                              sources=forecast_dict["sources"])
                         
                         # Cleanup
                         if CLEAN_LOCAL:
@@ -248,6 +273,8 @@ for key, location_data in list(data.items()):
             except Exception as e:
                 print(f"Error processing merra2 for {key}: {e}")
                 traceback.print_exc()
+                run_report.add_event(locname, "failed", f"read_geos_fp_cnn: {e}", spec="pm25",
+                                     obs_source=obs_source)
                 alert_read_failure("read_geos_fp_cnn", locname, e, lat=lat, lon=lon)
             
         if location_data["observation_source"] in ("NASA Pandora", "REMMAQ"):
@@ -261,10 +288,14 @@ for key, location_data in list(data.items()):
                     if s3_manager.file_exists(s3_key) and s3_manager.is_file_recent(s3_key, hours_threshold=STALE_HOURS):
                         age = s3_manager.get_file_age_hours(s3_key)
                         print(f"Skipping {locname} - recent ({age:.1f}h old)")
+                        run_report.add_event(locname, "skipped", f"recent forecast on S3 ({age:.1f}h old)",
+                                             obs_source=obs_source)
                         continue
                 else:
                     if funcs.is_forecast_recent(file_path, hours_threshold=FORECAST_HOURS_THRESHOLD):
                         print(f"Skipping {locname} - recent")
+                        run_report.add_event(locname, "skipped", "recent local forecast",
+                                             obs_source=obs_source)
                         continue
             
             # Source
@@ -276,8 +307,9 @@ for key, location_data in list(data.items()):
                 date_format = '%Y-%m-%d %H:%M'
                 obs_val_col = location_data["obs_options"]["no2"]["val_col"]
                 obs_url = f'{location_data["obs_options"]["no2"]["file"]}'
-                
-                
+                obs_unit = 'ppb'
+
+
             else:  # REMMAQ
                 obs_src = 'local'
                 col_name = 'local'
@@ -285,6 +317,7 @@ for key, location_data in list(data.items()):
                 date_format = location_data["obs_options"]["no2"]["time_parser"]
                 obs_val_col = location_data["obs_options"]["no2"]["val_col"]
                 obs_url = f'REMMAQ/{location_data["obs_options"]["no2"]["file"]}'
+                obs_unit = 'ugm3'
             
             print(f"Source: {obs_src} for {locname}")
             try:
@@ -298,7 +331,7 @@ for key, location_data in list(data.items()):
                  'openaq_id': None,
                  'obs_url': obs_url,
                  'resample' : '1h',
-                 'unit' : 'ppb',
+                 'unit' : obs_unit,
                  'interpolation': True,
                  'remove_outlier': True,
                  'start' : dt.datetime(2018, 1, 1),   
@@ -311,7 +344,7 @@ for key, location_data in list(data.items()):
                                      'lon_col': None,
                                      'remove_outlier': False,
                                     }
-                merged_data, metrics, model = get_localised_forecast(
+                fc_kwargs = dict(
                     loc=site_settings['l_name'],
                     spec=site_settings['species'],
                     lat=site_settings['lat'],
@@ -334,11 +367,15 @@ for key, location_data in list(data.items()):
                     silent=site_settings['silent'],
                     force_retrain=args.force_retrain,
                     force_obs_refresh=False,
-                    model_max_age_days=7,  
+                    model_max_age_days=7,
                     s3_manager=s3_manager,
+                    run_report=run_report,
                 )
+                merged_data, metrics, model = get_localised_forecast(**fc_kwargs)
                 if merged_data is None:
                     print(f"ERROR: Bias correction failed for {locname}")
+                    run_report.add_event(locname, "failed", "get_localised_forecast returned no data",
+                                         spec="no2", obs_source=obs_source)
                     alert_no_new_data(
                         "get_localised_forecast", locname,
                         reason="read_pandora/read_geos_cf/read_obs returned no usable data "
@@ -356,9 +393,37 @@ for key, location_data in list(data.items()):
                                  if metrics.get(k) is not None]
                     print(f"Model performance for {locname}: "
                           f"{', '.join(perf_bits) if perf_bits else 'no metrics available'}")
+
+                extra_species, metrics_by_species = {}, {"no2": metrics}
+                if source_type == "REMMAQ":
+                    for sp in ("o3", "pm25"):
+                        sp_opts = location_data["obs_options"].get(sp)
+                        if not sp_opts:
+                            continue
+                        print(f"\n{sp.upper()} forecast for {locname}")
+                        sp_data, sp_metrics, _ = get_localised_forecast(**{
+                            **fc_kwargs, "spec": sp,
+                            "OBS_URL": f'REMMAQ/{sp_opts["file"]}',
+                            "time_col": sp_opts["time_col"],
+                            "date_fmt": sp_opts["time_parser"],
+                            "obs_val_col": sp_opts["val_col"],
+                        })
+                        if sp_data is None:
+                            print(f"WARNING: {sp.upper()} correction failed for {locname}")
+                            run_report.add_event(locname, "failed", "get_localised_forecast returned no data",
+                                                 spec=sp, obs_source=obs_source)
+                            continue
+                        extra_species[sp] = (sp_data[["time", "localised", "value"]]
+                                             .drop_duplicates(subset=["time"])
+                                             .rename(columns={"localised": f"{sp}_corrected",
+                                                              "value": f"{sp}_{col_name}"}))
+                        metrics_by_species[sp] = sp_metrics
+
                 col_map = {"no2": "no2", "localised": "corrected", "value": col_name}
                 keep_cols = [c for c in ["time", "no2", "localised", "value", "o3", "pm25_rh35", "rh", "t", "tprec", "hcho"] if c in merged_data.columns]
                 fcast = merged_data[keep_cols].rename(columns=col_map).copy()
+                for sp_df in extra_species.values():
+                    fcast = fcast.merge(sp_df, on="time", how="left")
 
                 # Deduplicate and sort
                 fcast = fcast.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
@@ -366,9 +431,13 @@ for key, location_data in list(data.items()):
                 # Clip negatives
                 num_cols = fcast.select_dtypes(include=["float", "int"]).columns
                 fcast[num_cols] = fcast[num_cols].clip(lower=0)
-                
+
                 mask = fcast['corrected'] > fcast[col_name].max()
                 fcast.loc[mask, 'corrected'] = fcast.loc[mask, 'no2']
+                for sp, raw_col in (("o3", "o3"), ("pm25", "pm25_rh35")):
+                    if sp in extra_species and raw_col in fcast.columns:
+                        mask = fcast[f"{sp}_corrected"] > fcast[f"{sp}_{col_name}"].max()
+                        fcast.loc[mask, f"{sp}_corrected"] = fcast.loc[mask, raw_col]
 
                 # corrected is at least 0.1
                 if "corrected" in fcast.columns:
@@ -453,7 +522,9 @@ for key, location_data in list(data.items()):
                     merg = funcs.convert_times_column(merg, 'time', lat, lon)
 
                     # NowCast
-                    species_map = {'PM2.5': 'pm25_rh35', 'NO2': 'corrected', 'O3': 'o3'}
+                    species_map = {'PM2.5': 'pm25_corrected' if 'pm25' in extra_species else 'pm25_rh35',
+                                   'NO2': 'corrected',
+                                   'O3': 'o3_corrected' if 'o3' in extra_species else 'o3'}
                     avg_hours = {'NO2': 3, 'O3': 1}
                     merg = funcs.calculate_nowcast(merg, species_columns=species_map, avg_hours=avg_hours)
                     merg = funcs.calculate_overall_aqi(merg)
@@ -469,13 +540,22 @@ for key, location_data in list(data.items()):
                         "metrics": metadata,
                         "metadata": metadata
                     }
+                    if extra_species:
+                        forecast_dict["corrected_species"] = ["no2", *extra_species]
+                        forecast_dict["metrics_by_species"] = metrics_by_species
 
                     # Save
+                    out_species = ["no2", *extra_species]
                     if NO_LOCAL_SAVE:
                         if s3_manager.upload_json(forecast_dict, out_s3_key):
                             print(f"NO2 forecast ({variant_label}) for {locname} saved to S3")
+                            run_report.add_output(locname, out_species, s3_key=out_s3_key,
+                                                  variant=variant_label, n_rows=len(merg))
                         else:
                             print(f"Failed to save NO2 forecast ({variant_label}) for {locname}")
+                            run_report.add_event(locname, "failed",
+                                                 f"{variant_label} forecast upload to S3 failed",
+                                                 obs_source=obs_source)
                     else:
                         try:
                             with open(out_path, 'w') as f:
@@ -485,6 +565,9 @@ for key, location_data in list(data.items()):
                             # Upload
                             s3_manager.upload_file(out_path, out_s3_key)
                             print(f"NO2 forecast ({variant_label}) for {locname} uploaded to S3")
+                            run_report.add_output(locname, out_species, path=out_path,
+                                                  s3_key=out_s3_key, variant=variant_label,
+                                                  n_rows=len(merg))
 
                             # Cleaning
                             if CLEAN_LOCAL:
@@ -496,9 +579,12 @@ for key, location_data in list(data.items()):
             except Exception as e:
                 print(f"Error processing {source_type} for {key}: {e}")
                 traceback.print_exc()
+                run_report.add_event(locname, "failed", f"{type(e).__name__}: {e}",
+                                     obs_source=obs_source)
                 alert_read_failure(
                     "get_localised_forecast", locname, e,
                     obs_source=obs_src, lat=lat, lon=lon,
                 )
 
 print("\nForecast generation completed.")
+finalize_run_report()

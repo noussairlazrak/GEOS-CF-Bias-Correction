@@ -60,13 +60,29 @@ MODELS_LOCAL_DIR = os.path.join(_REPO_ROOT, "MODELS")
 S3_BUCKET        = os.environ.get("GEOS_CF_S3_BUCKET", "smce-geos-cf-public")
 S3_MODELS_PREFIX = "snwg_forecast_working_files/MODELS"
 
-PIPELINE_VERSION = 3
+PIPELINE_VERSION = 4
 
 HYBRID_OBS_SOURCES = {"pandora"}
 HYBRID_TARGETS     = ("ratio", "log_ratio")   # accepted when loading models
 OBS_TARGETS        = ("absolute", "log")
 HYBRID_TRAIN_TARGETS = ("log_ratio",)
+OBS_TRAIN_TARGETS  = ("absolute",)
 RATIO_CLIP         = (0.05, 20.0)
+
+_OBS_MET_FEATURES = ["zpbl", "t", "wind_speed", "wind_dir_sin", "wind_dir_cos",
+                     "hour_sin", "hour_cos", "doy_sin", "doy_cos", "is_weekend"]
+OBS_SIMPLE_FEATURES = {
+    "no2":  ["no2", "no", "co", "o3", "tropcol_no2"] + _OBS_MET_FEATURES,
+    "o3":   ["o3", "no2", "no", "co", "hcho", "cldtt", "rh"] + _OBS_MET_FEATURES,
+    "pm25": ["pm25_rh35", "aod550_bc", "aod550_oc", "aod550_sulfate", "aod550_dust",
+             "co", "rh", "tprec"] + _OBS_MET_FEATURES,
+}
+
+OBS_EXCLUDE_PERIODS = {
+    ("ecuador_quito_cotocollao", "no2"): [("2019-01-01", "2019-07-31 23:00"),
+                                          ("2021-09-01", "2021-09-30 23:00")],
+    ("ecuador_quito_elcamal", "o3"):     [("2024-12-01", "2025-06-30 23:00")],
+}
 
 MIN_FEATURE_COVERAGE = 0.5
 MAX_TREES            = 3000
@@ -250,6 +266,14 @@ def _make_regressor(algo: str, n_estimators: int, n_samples: int,
                     early_stopping: bool = False):
     """Gradient-boosted regressor with defaults tuned for hourly site data."""
     min_leaf = int(np.clip(n_samples // 200, 10, 50))
+    if algo == "lgbm_simple":
+        return lgb.LGBMRegressor(
+            n_estimators=n_estimators, learning_rate=0.05,
+            num_leaves=7, max_depth=3, min_child_samples=200,
+            subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+            reg_lambda=10.0,
+            verbosity=-1, random_state=42,
+        )
     if algo == "lgbm_reg":
         return lgb.LGBMRegressor(
             n_estimators=n_estimators, learning_rate=0.03,
@@ -343,13 +367,13 @@ def _predict_concentration(m, feats, tmode: str, df: pd.DataFrame,
 def _train_site_model(merged: pd.DataFrame, spec: str, hybrid: bool,
                       rmv_out: bool = True, silent: bool = False):
     """
-    Train a per-site model, choosing among LightGBM / XGBoost / their blend
-    and two target transforms by time-series CV R² (in concentration space).
+    Train a per-site model, scored by time-series CV R² (in concentration space).
 
-    * hybrid (Pandora): target = obs / GEOS-CF, as ``ratio`` or ``log_ratio``.
+    * hybrid (Pandora): target = obs / GEOS-CF (``log_ratio``); LightGBM /
+      XGBoost / their blend, picked by CV.
     * obs-based (local sources, e.g. REMMAQ): the model predicts the local
-      observation directly, as ``absolute`` or ``log``; GEOS-CF fields are
-      just features.
+      observation directly (``absolute``) with one shallow LightGBM
+      (``lgbm_simple``) on ``OBS_SIMPLE_FEATURES[spec]``.
 
     Returns (model, features, metrics) or (None, None, None).
     """
@@ -366,7 +390,7 @@ def _train_site_model(merged: pd.DataFrame, spec: str, hybrid: bool,
         target_modes = HYBRID_TRAIN_TARGETS
     else:
         df["value"] = df["value"].clip(lower=0)
-        target_modes = OBS_TARGETS
+        target_modes = OBS_TRAIN_TARGETS
 
     if rmv_out and len(df) > 100:
         if hybrid:
@@ -389,6 +413,8 @@ def _train_site_model(merged: pd.DataFrame, spec: str, hybrid: bool,
 
     skip     = {"time", "location", "lat", "lon", "value", "bias_ratio"}
     num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in skip]
+    if not hybrid and spec in OBS_SIMPLE_FEATURES:
+        num_cols = [c for c in OBS_SIMPLE_FEATURES[spec] if c in num_cols]
     coverage = df[num_cols].notna().mean()
     sel_feats = [c for c in num_cols
                  if coverage[c] >= MIN_FEATURE_COVERAGE and df[c].nunique(dropna=True) > 1]
@@ -402,8 +428,11 @@ def _train_site_model(merged: pd.DataFrame, spec: str, hybrid: bool,
     raw = df[raw_col].values.astype(float) if raw_col else None
     sel_feats = list(X.columns)
 
-    algos = ["lgbm", "lgbm_reg"] + (["xgb"] if xgb is not None else [])
-    if xgb is None and not silent:
+    if hybrid:
+        algos = ["lgbm", "lgbm_reg"] + (["xgb"] if xgb is not None else [])
+    else:
+        algos = ["lgbm_simple"]
+    if hybrid and xgb is None and not silent:
         print("WARNING: xgboost not installed — training LightGBM only")
 
     n_splits = min(5, max(2, len(df) // 500))
@@ -1020,7 +1049,8 @@ def _load_observations(obs_src: str, obs_url: str,
         source=obs_src, url=obs_url, time_col=time_col,
         date_format=date_fmt, value_collum=obs_val_col,
         lat_col=lat_col, lon_col=lon_col, species=spec,
-        lat=lat, lon=lon, unit=unit, remove_outlier=rmv_out, **kwargs,
+        lat=lat, lon=lon, unit=unit,
+        remove_outlier=False if obs_src == "local" else rmv_out, **kwargs,
     )
     if site._obs is None or (hasattr(site._obs, "empty") and site._obs.empty):
         return pd.DataFrame()
@@ -1148,6 +1178,7 @@ def get_localised_forecast(
     obs_cache_hours: int = DEFAULT_CACHE_HOURS,
     s3_manager: S3Manager = None,
     retrain_min_new_obs_days: int = 60,
+    run_report=None,
     **kwargs,
 ):
     """
@@ -1212,6 +1243,9 @@ def get_localised_forecast(
     s3_manager : S3Manager, optional
         Pre-configured S3Manager.  Created automatically from ``S3_BUCKET``
         if not supplied.
+    run_report : MLpred.run_report.RunReport, optional
+        Receives the observation sample, every model trained or served, and
+        the generated forecast, for the end-of-run knowledge graph report.
 
     Returns
     -------
@@ -1249,6 +1283,19 @@ def get_localised_forecast(
 
         obs_data = (obs_data.dropna(subset=["time", "value"])
                             .groupby("time", as_index=False)["value"].mean())
+
+        _excluded = []
+        for _st, _ed in OBS_EXCLUDE_PERIODS.get((loc_clean, spec), []):
+            _bad = obs_data["time"].between(pd.Timestamp(_st), pd.Timestamp(_ed))
+            obs_data = obs_data[~_bad]
+            _excluded.append({"start": _st, "end": _ed, "n": int(_bad.sum())})
+            if not silent and _bad.any():
+                print(f"INFO: Excluded {_bad.sum()} obs in known-bad period {_st} → {_ed}")
+
+        if run_report is not None:
+            run_report.add_location(loc, lat=lat, lon=lon, obs_source=obs_src)
+            run_report.add_observations(loc, spec, obs_data, obs_source=obs_src,
+                                        input_unit=unit, excluded=_excluded)
 
         if not silent:
             print(f"INFO: {len(obs_data)} observations "
@@ -1379,9 +1426,10 @@ def get_localised_forecast(
                         _pm = None
                 if _pm:
                     mets.update({k: _pm.get(k) for k in
-                                 ("RMSE", "R2", "MAE", "CV_R2", "n_train", "trained_at",
+                                 ("RMSE", "R2", "MAE", "CV_R2", "CV_RMSE", "CV_MAE",
+                                  "Train_R2", "n_train", "trained_at",
                                   "algorithm", "approach", "pipeline_version",
-                                  "obs_end", "per_site",
+                                  "obs_start", "obs_end", "per_site",
                                   "global_CV_RMSE", "global_CV_R2")
                                  if _pm.get(k) is not None})
                 return m, feats, tmode, mets.get("R2"), mets
@@ -1648,6 +1696,8 @@ def get_localised_forecast(
                 cv_r2 = _new_mets["CV_R2"]
                 _save_model(_new_m, _new_f, loc_clean, spec, s3_manager, silent=silent,
                             target_mode=_new_mets["target"], metrics=_new_mets)
+                if run_report is not None:
+                    run_report.add_model(loc, spec, _new_m, _new_f, _new_mets, role="trained")
                 if cv_r2 >= R2_MIN_THRESHOLD:
                     model, sel_feats, metrics = _new_m, _new_f, _new_mets
                 else:
@@ -1678,6 +1728,8 @@ def get_localised_forecast(
 
         # Record which model actually served this location's forecast.
         _persist_location_metrics(loc_clean, spec, s3_manager, metrics, silent=silent)
+        if run_report is not None:
+            run_report.add_model(loc, spec, model, sel_feats, metrics, role="served")
 
         # Predict
         if not silent:
@@ -1729,6 +1781,8 @@ def get_localised_forecast(
 
         print(f"INFO: Model performance for {loc} ({spec.upper()}): "
               f"{_format_metrics_summary(metrics)}")
+        if run_report is not None:
+            run_report.add_forecast(loc, spec, result, model)
 
         return result, metrics, model
 
